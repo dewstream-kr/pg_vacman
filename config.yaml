@@ -1,0 +1,241 @@
+db:
+  # PostgreSQL endpoint to connect to.
+  # This connection is used as the "control connection" first:
+  # - acquire advisory lock (to prevent overlapping runs)
+  # - query pg_database to discover target DBs (unless include_databases is set)
+  host: "127.0.0.1"
+  port: 5432
+
+  # Control DB name.
+  # Typically "postgres" is fine. It MUST be a database you can connect to.
+  dbname: "postgres"
+
+  # Login role used by pg_vacman.
+  # Requirements:
+  # - CONNECT on target DBs
+  # - USAGE on schemas + privileges to run ANALYZE/VACUUM on target tables
+  #   (VACUUM FULL may require stronger privileges and will take ACCESS EXCLUSIVE locks)
+  user: "postgres"
+  password: "password"
+
+  # Connection timeout for each connect attempt.
+  connect_timeout_sec: 5
+
+  # Visible in pg_stat_activity as application_name.
+  # pg_vacman automatically appends suffixes:
+  # - ":control" for control connection
+  # - ":worker" for per-table workers
+  application_name: "pg_vacman"
+
+
+targets:
+  # If include_databases is EMPTY:
+  # - pg_vacman discovers databases via pg_database,
+  # - then applies exclude_templates / require_allow_conn / exclude_databases filters.
+  #
+  # If include_databases is NOT EMPTY:
+  # - ONLY those DBs are targeted (missing DBs will be warned and skipped).
+  include_databases: []
+
+  # Databases to always exclude (exact names).
+  # NOTE: template0/template1 are common defaults, but you can add "postgres" too
+  # if you do not want to run maintenance there.
+  exclude_databases: ["template0", "template1"]
+
+  # When discovering DBs from pg_database:
+  # - exclude templates (datistemplate = true)
+  exclude_templates: true
+
+  # When discovering DBs from pg_database:
+  # - only include DBs that allow connections (datallowconn = true)
+  require_allow_conn: true
+
+  # Maximum number of DBs to process per run.
+  # 0 = no limit.
+  # Useful when you have many DBs and want to "batch" work over multiple runs.
+  max_databases_per_run: 0
+
+  # If true, pg_vacman checks pg_is_in_recovery() on each target DB.
+  # - If it is a standby (in recovery), that DB is skipped.
+  # Recommended when you might run this from a replica/standby host by mistake.
+  primary_only: true
+
+
+run:
+  # Advisory lock key for singleton run control.
+  # If another pg_vacman holds the same key, this run exits early.
+  advisory_lock_key: 90421001
+
+  # Timezone used for timestamps AND for vacuum_full time window checks.
+  timezone: "Asia/Seoul"
+
+  # Default mode if CLI does not specify --dry-run/--apply.
+  # - true  => DRY-RUN (plan only)
+  # - false => APPLY (execute)
+  dry_run_default: true
+
+  # Logging level: debug / info / warning / error
+  log_level: "info"
+
+  # Run report detail:
+  # - basic   : smaller JSON
+  # - verbose : includes per-table decision inputs and skipped objects (bounded)
+  json_detail_level: "verbose"
+
+  # When verbose, how many filtered-out objects to record per DB (to avoid huge JSON).
+  json_max_skips_per_db: 50
+
+  # If --json-out is not provided:
+  # - when true: auto-save JSON under json_out_dir with timestamped name
+  # - when false: do not write JSON unless --json-out is set
+  json_auto_save: true
+  json_out_dir: "./runs"
+  json_out_prefix: "run"
+
+  # Notification output controls:
+  # - the tool sends a compact summary + per-DB per-table results
+  # - to prevent excessively long messages, limit detail rows per DB
+  notify_max_actions_per_db: 30
+
+  # Include executed SQL in notifications (WARNING: message length can explode).
+  notify_include_sql: false
+
+
+thresholds:
+  # Tables smaller than this size (MB) are always SKIPPED.
+  # This prevents wasting time on small tables where maintenance impact is low.
+  min_table_size_mb: 10
+
+  # dead_ratio = n_dead_tup / (n_live_tup + n_dead_tup)
+  # If dead_ratio >= min_dead_ratio AND (vacuum/analyze is stale), VACUUM (ANALYZE) is scheduled.
+  min_dead_ratio: 0.10
+
+  # "Staleness" thresholds:
+  # - If last analyze age >= max_analyze_age_hours => needs_analyze = true
+  # - If last vacuum age  >= max_last_vacuum_age_hours => needs_vacuum = true
+  #
+  # IMPORTANT:
+  # Setting these to 0 makes needs_* almost always TRUE (age >= 0),
+  # which may result in frequent ANALYZE/VACUUM on most tables above min_table_size_mb.
+  #
+  # Safe starter recommendations:
+  # - max_analyze_age_hours: 24 ~ 168 (1~7 days)
+  # - max_last_vacuum_age_hours: 48 ~ 336 (2~14 days)
+  max_analyze_age_hours: 0
+  max_last_vacuum_age_hours: 0
+
+  # freeze_age is derived from age(relfrozenxid).
+  # If freeze_age >= freeze_age_threshold, VACUUM (FREEZE, ANALYZE) may be chosen.
+  # NOTE: This is a guardrail. Choose value based on your autovacuum/freeze strategy.
+  freeze_age_threshold: 1500000000
+
+  vacuum_full:
+    # VACUUM FULL takes ACCESS EXCLUSIVE lock and rewrites the table.
+    # This can block reads/writes and should be used sparingly.
+    enabled: false
+
+    # Allowed time window for VACUUM FULL (local timezone in run.timezone).
+    # If end <= start, window wraps over midnight.
+    start: "01:00"
+    end: "05:00"
+
+    # Additional requirements for VACUUM FULL:
+    # - dead_ratio >= min_dead_ratio
+    # - table size >= min_table_size_mb
+    min_dead_ratio: 0.60
+    min_table_size_mb: 2048
+
+
+limits:
+  # Per-DB action limiting:
+  # - max_tables_per_db: trims planned actions per DB (largest tables first)
+  # - max_actions_global: trims across entire run
+  # 0 = no limit.
+  max_tables_per_db: 0
+  max_actions_global: 0
+
+  # Parallel workers per DB.
+  # Example: 2 means "at most 2 tables at a time" per DB.
+  parallel_tables_per_db: 2
+
+  # Global parallel limit across the entire run (all DBs combined).
+  # This is enforced using a semaphore to protect the cluster from overload.
+  global_parallel_limit: 2
+
+  # Optional pacing between actions (helps reduce burst load).
+  sleep_between_tables_sec: 0.3
+  sleep_between_databases_sec: 1.0
+
+  # Safety timeouts applied per worker session:
+  # - lock_timeout prevents long waits on conflicting locks
+  # - statement_timeout caps per-table maintenance execution time
+  lock_timeout_ms: 2000
+  per_table_statement_timeout_sec: 1800
+
+  # Optional vacuum cost tuning (applies per worker session).
+  # These can reduce IO pressure at the cost of longer runtimes.
+  vacuum_cost_delay_ms: 10
+  vacuum_cost_limit: 200
+
+
+filters:
+  # Schema filter is applied at candidate query time.
+  # If include_schemas is EMPTY => all schemas except excluded ones are considered.
+  include_schemas: []
+
+  # Exclude schemas by name.
+  # NOTE: The code already excludes pg_catalog and information_schema in SQL by default,
+  # but keeping these here is fine for documentation/clarity.
+  exclude_schemas: ["pg_catalog", "information_schema"]
+
+  # Object patterns allow precise control per DB and per table.
+  #
+  # Pattern formats:
+  # - "db:schema.table"  (glob supported: *, ?, [])
+  # - "schema.table"     (DB omitted => treated as "*:schema.table")
+  #
+  # Rules:
+  # - exclude_objects has priority over include_objects
+  # - if include_objects is empty => allow all (except excluded)
+  include_objects:
+    # - "db1:public.orders_*"
+    # - "*:vacuum_test.*"
+
+  exclude_objects:
+    - "db2:vacuum_test.*"
+    - "*:public.do_not_touch"
+
+  # Backward compatibility keys.
+  # If you fill these, pg_vacman merges them into include_objects/exclude_objects
+  # as "*:<schema.table>" patterns.
+  include_tables: []
+  exclude_tables: []
+
+
+force:
+  # If enabled, matching tables bypass thresholds and run the forced action.
+  enabled: true
+
+  # Default action used when an entry is a plain string pattern.
+  # Allowed: ANALYZE / VACUUM_ANALYZE / VACUUM_FREEZE_ANALYZE / VACUUM_FULL_ANALYZE
+  default_action: "ANALYZE"
+
+  # Force entries:
+  # - string: treated as {pattern: "...", action: default_action}
+  # - map: explicit {pattern, action}
+  tables:
+    - "*:public.insert_only_*"
+    - pattern: "db1:public.append_only_*"
+      action: "VACUUM_FREEZE_ANALYZE"
+    - pattern: "db2:public.event_log_*"
+      action: "ANALYZE"
+
+
+notify:
+  # Slack Incoming Webhook URL.
+  # If empty, Slack notification is skipped.
+  slack_webhook_url: "https://hooks.slack.com/services/xxxxxxxxxxxxxxxx"
+
+  # Telegram settings (optional). If token/chat_id are empty, Telegram is skipped.
+  telegram_bot_token: ""
+  telegram_chat_id: ""
