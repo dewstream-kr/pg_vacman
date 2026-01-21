@@ -121,8 +121,8 @@ thresholds:
   # Safe starter recommendations:
   # - max_analyze_age_hours: 24 ~ 168 (1~7 days)
   # - max_last_vacuum_age_hours: 48 ~ 336 (2~14 days)
-  max_analyze_age_hours: 0
-  max_last_vacuum_age_hours: 0
+  max_analyze_age_hours: 24
+  max_last_vacuum_age_hours: 48
 
   # freeze_age is derived from age(relfrozenxid).
   # If freeze_age >= freeze_age_threshold, VACUUM (FREEZE, ANALYZE) may be chosen.
