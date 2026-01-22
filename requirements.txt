@@ -1,0 +1,39 @@
+#
+# pg_vacman - runtime dependencies
+#
+# Target environment:
+#   - Python >= 3.7 (Python 3.6 supported with conditional dataclasses)
+#   - PostgreSQL client libraries via psycopg
+#
+
+# ------------------------------------------------------------
+# PostgreSQL driver
+#
+# pg_vacman prefers psycopg3.
+# If psycopg3 is not available at runtime, the code falls back
+# to psycopg2 (psycopg2-binary).
+# ------------------------------------------------------------
+
+# psycopg3 (recommended)
+psycopg[binary]>=3.1,<4.0
+
+# psycopg2 fallback (used only if psycopg3 import fails)
+psycopg2-binary>=2.9,<3.0
+
+
+# ------------------------------------------------------------
+# Configuration file loader (YAML)
+# ------------------------------------------------------------
+PyYAML>=6.0,<7.0
+
+
+# ------------------------------------------------------------
+# HTTP client for Slack / Telegram notifications
+# ------------------------------------------------------------
+requests>=2.25,<3.0
+
+
+# ------------------------------------------------------------
+# Python standard library backport (Python 3.6 only)
+# ------------------------------------------------------------
+dataclasses; python_version < "3.7"
