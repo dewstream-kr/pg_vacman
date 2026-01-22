@@ -34,15 +34,19 @@ It also supports:
 ### Python Versions
 
 - **Python 3.7 or later** (recommended)
-- Python 3.6 supported with `dataclasses` backport
+- Python 3.6 / OpenSSL 1.0.2k supported via `pg_vacman_py36.py` + `requirements_py36.txt`
 
 ### Runtime Dependencies
 
-- PostgreSQL driver: `psycopg` (v3 preferred)  
-  Fallback: `psycopg2-binary` if `psycopg` is not available
-- YAML configuration loader: `PyYAML`
-- HTTP client for notifications: `requests`
-- Optional: `dataclasses` (for Python 3.6)
+- PostgreSQL driver:
+  - Modern: `psycopg` (v3 preferred)
+  - Fallback: `psycopg2-binary`
+  - Legacy (Python 3.6): pin `psycopg2-binary==2.9.6` (cp36 wheels)
+- YAML configuration loader:
+  - Modern: `PyYAML>=6`
+  - Legacy (Python 3.6): pin `PyYAML==6.0.1` (`6.0.2+` requires Python >=3.8)
+- HTTP client for notifications:
+  - Optional: `requests` (Python 3.6: pin `requests==2.27.1`)
 
 ### PostgreSQL Privileges
 
@@ -91,14 +95,14 @@ pip install "psycopg[binary]>=3.1,<4.0" \
             "requests>=2.25,<3.0"
 ```
 
-If you are running Python 3.6:
-```bash
-pip install dataclasses
-```
+Legacy (Python 3.6 / RHEL7-CentOS7)
 
-Verify Installation
+Use the compatibility entrypoint and pinned dependencies:
+
 ```bash
-python -c "import psycopg, yaml, requests; print('OK')"
+python3.6 -m pip install -r requirements_py36.txt
+python3.6 -c "import psycopg2, yaml; print('OK')"
+python3.6 pg_vacman_py36.py --config config.local.yaml --dry-run
 ```
 
 ## Quick Start
@@ -128,12 +132,16 @@ Optional sections:
 No SQL is executed.
 ```bash
 python3 pg_vacman.py --config config.local.yaml --dry-run
+# Legacy (Python 3.6):
+# python3.6 pg_vacman_py36.py --config config.local.yaml --dry-run
 ```
 
 ### 4. Apply (Execute Actions)
 
 ```bash
 python3 pg_vacman.py --config config.local.yaml --apply
+# Legacy (Python 3.6):
+# python3.6 pg_vacman_py36.py --config config.local.yaml --apply
 ```
 
 ### 5. JSON Run Report
@@ -149,6 +157,8 @@ python3 pg_vacman.py \
   --config config.local.yaml \
   --apply \
   --json-out ./runs/run.json
+# Legacy (Python 3.6):
+# python3.6 pg_vacman_py36.py --config config.local.yaml --apply --json-out ./runs/run.json
 ```
 
 ---
