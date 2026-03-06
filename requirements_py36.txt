@@ -1,0 +1,14 @@
+# pg_vacman (Python 3.6 / RHEL7-CentOS7 / OpenSSL 1.0.2k friendly)
+#
+# NOTE
+# - psycopg2-binary 2.9.7+ stopped publishing cp36 wheels, and newer releases also raise
+#   the minimum supported Python version. For Python 3.6, pin to 2.9.6.
+# - PyYAML 6.0.2+ requires Python >=3.8. For Python 3.6, pin to 6.0.1.
+
+# Core
+psycopg2-binary==2.9.6
+PyYAML==6.0.1
+
+# Optional (notifications). If you install this, keep requests in the 2.27.x series for Python 3.6.
+# (The script works without requests; it falls back to urllib.)
+requests==2.27.1
