@@ -4,7 +4,7 @@
 # -*- coding: utf-8 -*-
 
 """
-pg_vacman v1.0: PostgreSQL maintenance manager (multi-database VACUUM/ANALYZE runner)
+pg_vacman v1.1: PostgreSQL maintenance manager (multi-database VACUUM/ANALYZE runner)
 
 This tool scans tables across one or more databases, decides whether to run
 ANALYZE / VACUUM (ANALYZE) / VACUUM (FREEZE, ANALYZE) / VACUUM (FULL, ANALYZE),
@@ -18,6 +18,10 @@ Key features
 - Safety controls (lock_timeout, statement_timeout, advisory lock to avoid overlap)
 - Graceful stop (Ctrl+C once) and immediate stop (Ctrl+C twice / SIGTERM)
 - JSON run report + optional Slack/Telegram notifications
+- OK/SKIP/FAIL outcome classification
+- Optional precheck to avoid colliding with autovacuum/ongoing maintenance
+- Optional retry/backoff for deferrable failures (lock timeout, statement timeout, deadlock...)
+- Optional VACUUM FULL allowlist guardrails (downgrade to VACUUM or SKIP)
 
 Dependencies
 - Python 3.7+:
@@ -36,6 +40,7 @@ import fnmatch
 import json
 import logging
 import os
+import random
 import signal
 import sys
 import threading
@@ -65,6 +70,8 @@ allowed_actions = {
     "VACUUM_FREEZE_ANALYZE",
     "VACUUM_FULL_ANALYZE",
 }
+
+allowed_statuses = {"OK", "SKIP", "FAIL"}
 
 # Stop flags:
 # - graceful_stop_event: stop scheduling new work; let in-flight tasks finish
@@ -293,6 +300,32 @@ def age_hours(ts: Optional[dt.datetime], now: dt.datetime) -> Optional[float]:
         ts = ts.replace(tzinfo=now.tzinfo)
 
     return (now - ts).total_seconds() / 3600.0
+
+
+def _json_safe_value(v: Any) -> Any:
+    """Convert values that are not JSON-serializable into safe representations."""
+    if isinstance(v, (dt.datetime, dt.date, dt.time)):
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "replace")
+        except Exception:
+            return str(v)
+    return v
+
+
+def json_safe(obj: Any) -> Any:
+    """Recursively make a structure JSON-serializable."""
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_safe(x) for x in obj]
+    if isinstance(obj, tuple):
+        return [json_safe(x) for x in obj]
+    return _json_safe_value(obj)
 
 
 def slack_notify(webhook_url: str, text: str) -> None:
@@ -840,6 +873,652 @@ def cancel_all_active_conns() -> None:
             pass
 
 
+# -----------------------------
+# v1.1 add-ons: error classify / precheck / retry / VACUUM FULL policy
+# -----------------------------
+
+def _extract_sqlstate(exc: Exception) -> str:
+    """Best-effort SQLSTATE extraction for psycopg3/psycopg2 exceptions."""
+    try:
+        code = getattr(exc, "sqlstate", "") or ""
+        if code:
+            return str(code)
+    except Exception:
+        pass
+    try:
+        code = getattr(exc, "pgcode", "") or ""
+        if code:
+            return str(code)
+    except Exception:
+        pass
+    return ""
+
+
+def classify_pg_exception(exc: Exception) -> Dict[str, Any]:
+    """
+    Classify PostgreSQL exception into deferrable(SKIP) vs fatal(FAIL).
+
+    Returns:
+      {
+        "status": "SKIP" | "FAIL",
+        "category": "...",
+        "sqlstate": "...",
+        "retryable": bool,
+      }
+    """
+    msg = str(exc) or ""
+    m = msg.lower()
+    code = _extract_sqlstate(exc)
+
+    # 55P03: lock_not_available (also used by lock_timeout)
+    if code == "55P03":
+        if "lock timeout" in m:
+            return {"status": "SKIP", "category": "lock_timeout", "sqlstate": code, "retryable": True}
+        return {"status": "SKIP", "category": "lock_not_available", "sqlstate": code, "retryable": True}
+
+    # 57014: query_canceled / statement_timeout
+    if code == "57014":
+        if "statement timeout" in m:
+            return {"status": "SKIP", "category": "statement_timeout", "sqlstate": code, "retryable": True}
+        if "lock timeout" in m:
+            return {"status": "SKIP", "category": "lock_timeout", "sqlstate": code, "retryable": True}
+        if "canceling statement due to user request" in m:
+            return {"status": "SKIP", "category": "query_canceled", "sqlstate": code, "retryable": False}
+        return {"status": "SKIP", "category": "query_canceled", "sqlstate": code, "retryable": False}
+
+    # 40P01: deadlock_detected
+    if code == "40P01":
+        return {"status": "SKIP", "category": "deadlock_detected", "sqlstate": code, "retryable": True}
+
+    # 40001: serialization_failure
+    if code == "40001":
+        return {"status": "SKIP", "category": "serialization_failure", "sqlstate": code, "retryable": True}
+
+    # Fallback message matching
+    if "deadlock detected" in m:
+        return {"status": "SKIP", "category": "deadlock_detected", "sqlstate": code, "retryable": True}
+    if "lock timeout" in m:
+        return {"status": "SKIP", "category": "lock_timeout", "sqlstate": code, "retryable": True}
+    if "lock not available" in m or "could not obtain lock" in m:
+        return {"status": "SKIP", "category": "lock_not_available", "sqlstate": code, "retryable": True}
+    if "statement timeout" in m:
+        return {"status": "SKIP", "category": "statement_timeout", "sqlstate": code, "retryable": True}
+
+    return {"status": "FAIL", "category": "other", "sqlstate": code, "retryable": False}
+
+
+def get_precheck_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    precheck config:
+      precheck:
+        enabled: true
+        skip_if_autovacuum_running: true
+        skip_if_vacuum_running: false
+        skip_if_analyze_running: false
+        skip_vacuum_full_if_relation_locked: true
+    """
+    pcfg = cfg.get("precheck", {}) or {}
+    return {
+        "enabled": bool(pcfg.get("enabled", False)),
+        "skip_if_autovacuum_running": bool(pcfg.get("skip_if_autovacuum_running", True)),
+        "skip_if_vacuum_running": bool(pcfg.get("skip_if_vacuum_running", False)),
+        "skip_if_analyze_running": bool(pcfg.get("skip_if_analyze_running", False)),
+        "skip_vacuum_full_if_relation_locked": bool(pcfg.get("skip_vacuum_full_if_relation_locked", True)),
+    }
+
+
+def get_retry_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    retry config:
+      retry:
+        enabled: true
+        max_attempts: 2
+        base_sleep_ms: 250
+        max_sleep_ms: 5000
+        jitter_ms: 250
+        retryable_categories: [lock_timeout, lock_not_available, statement_timeout, deadlock_detected, serialization_failure, query_canceled]
+        overrides:
+          - db_pattern: "prod*"
+            start: "01:00"
+            end: "05:00"
+            max_attempts: 3
+    """
+    r = cfg.get("retry", {}) or {}
+    enabled = bool(r.get("enabled", True))
+
+    try:
+        max_attempts = max(1, int(r.get("max_attempts", 1) or 1))
+    except Exception:
+        max_attempts = 1
+
+    base_sleep_ms = int(r.get("base_sleep_ms", 250) or 250)
+    max_sleep_ms = int(r.get("max_sleep_ms", 5000) or 5000)
+    jitter_ms = int(r.get("jitter_ms", 250) or 250)
+
+    cats = set([str(x).strip() for x in (r.get("retryable_categories") or []) if str(x).strip()])
+    if not cats:
+        cats = {
+            "lock_timeout",
+            "lock_not_available",
+            "statement_timeout",
+            "deadlock_detected",
+            "serialization_failure",
+            "query_canceled",
+        }
+
+    return {
+        "enabled": enabled,
+        "max_attempts": max_attempts,
+        "base_sleep_ms": base_sleep_ms,
+        "max_sleep_ms": max_sleep_ms,
+        "jitter_ms": jitter_ms,
+        "retryable_categories": cats,
+        "overrides": list(r.get("overrides") or []),
+    }
+
+
+def _backoff_sleep_ms(attempt: int, base_sleep_ms: int, max_sleep_ms: int, jitter_ms: int) -> int:
+    """Exponential backoff with jitter (ms)."""
+    try:
+        p = max(1, int(attempt))
+    except Exception:
+        p = 1
+    sleep = int(base_sleep_ms) * (2 ** (p - 1))
+    sleep = min(int(max_sleep_ms), sleep)
+    if jitter_ms and jitter_ms > 0:
+        try:
+            sleep += random.randint(0, int(jitter_ms))
+        except Exception:
+            pass
+    return max(0, int(sleep))
+
+
+def effective_retry_cfg(cfg: Dict[str, Any], dbname: str, action: str, local_now: dt.datetime) -> Dict[str, Any]:
+    """Apply retry overrides (db/time window/action pattern)."""
+    base = get_retry_cfg(cfg)
+    overrides = list(base.get("overrides") or [])
+    applied: List[Dict[str, Any]] = []
+
+    act = str(action or "").upper().strip()
+
+    for ov in overrides:
+        if not isinstance(ov, dict):
+            continue
+
+        db_pat = str(ov.get("db_pattern", "*") or "*")
+        if not fnmatch.fnmatchcase(dbname, db_pat):
+            continue
+
+        act_pat = str(ov.get("action_pattern") or ov.get("action") or "").upper().strip()
+        if act_pat and not fnmatch.fnmatchcase(act, act_pat):
+            continue
+
+        start = ov.get("start", None)
+        end = ov.get("end", None)
+        if start is not None and end is not None:
+            try:
+                if not in_time_window(local_now, str(start), str(end)):
+                    continue
+            except Exception:
+                continue
+
+        if "enabled" in ov:
+            base["enabled"] = bool(ov.get("enabled"))
+        if "max_attempts" in ov:
+            try:
+                base["max_attempts"] = max(1, int(ov.get("max_attempts") or 1))
+            except Exception:
+                pass
+        if "base_sleep_ms" in ov:
+            try:
+                base["base_sleep_ms"] = int(ov.get("base_sleep_ms") or base.get("base_sleep_ms", 250))
+            except Exception:
+                pass
+        if "max_sleep_ms" in ov:
+            try:
+                base["max_sleep_ms"] = int(ov.get("max_sleep_ms") or base.get("max_sleep_ms", 5000))
+            except Exception:
+                pass
+        if "jitter_ms" in ov:
+            try:
+                base["jitter_ms"] = int(ov.get("jitter_ms") or base.get("jitter_ms", 250))
+            except Exception:
+                pass
+        if "retryable_categories" in ov:
+            cats = set([str(x).strip() for x in (ov.get("retryable_categories") or []) if str(x).strip()])
+            if cats:
+                base["retryable_categories"] = cats
+
+        applied.append(
+            {
+                "db_pattern": db_pat,
+                "action_pattern": act_pat or None,
+                "start": str(start) if start is not None else None,
+                "end": str(end) if end is not None else None,
+            }
+        )
+
+    base["overrides_applied"] = applied
+    return base
+
+
+def get_vacuum_full_policy_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    vacuum_full_policy config:
+      vacuum_full_policy:
+        enabled: true
+        allow_objects: ["*:public.big_*", "prod_db:analytics.fact_*"]
+        on_miss: "VACUUM_ANALYZE"  # or "SKIP"
+        force_bypass: false
+    """
+    pol = cfg.get("vacuum_full_policy", {}) or {}
+    enabled = bool(pol.get("enabled", False))
+    allow_objects = list(pol.get("allow_objects") or pol.get("allowlist_objects") or [])
+    on_miss = str(pol.get("on_miss", "VACUUM_ANALYZE") or "VACUUM_ANALYZE").upper().strip()
+    if on_miss not in ("VACUUM_ANALYZE", "SKIP"):
+        on_miss = "VACUUM_ANALYZE"
+    force_bypass = bool(pol.get("force_bypass", False))
+    return {"enabled": enabled, "allow_objects": allow_objects, "on_miss": on_miss, "force_bypass": force_bypass}
+
+
+def vacuum_full_policy_decision(
+    cfg: Dict[str, Any],
+    dbname: str,
+    schema: str,
+    table: str,
+    force_dec: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return whether VACUUM FULL is allowed for the object (allowlist-based)."""
+    pol = get_vacuum_full_policy_cfg(cfg)
+    if not pol.get("enabled", False):
+        return {
+            "enabled": False,
+            "allowed": True,
+            "matched_pattern": None,
+            "on_miss": None,
+            "force_bypass": bool(pol.get("force_bypass", False)),
+            "reason": "disabled",
+        }
+
+    if (
+        bool(pol.get("force_bypass", False))
+        and bool(force_dec.get("matched"))
+        and str(force_dec.get("action")) == "VACUUM_FULL_ANALYZE"
+    ):
+        return {
+            "enabled": True,
+            "allowed": True,
+            "matched_pattern": force_dec.get("pattern"),
+            "on_miss": pol.get("on_miss"),
+            "force_bypass": True,
+            "reason": "force_bypass",
+        }
+
+    patterns = list(pol.get("allow_objects") or [])
+    if not patterns:
+        return {
+            "enabled": True,
+            "allowed": False,
+            "matched_pattern": None,
+            "on_miss": pol.get("on_miss"),
+            "force_bypass": bool(pol.get("force_bypass", False)),
+            "reason": "allowlist_empty",
+        }
+
+    for pat in patterns:
+        if match_object_pattern(dbname, schema, table, str(pat)):
+            return {
+                "enabled": True,
+                "allowed": True,
+                "matched_pattern": str(pat),
+                "on_miss": pol.get("on_miss"),
+                "force_bypass": bool(pol.get("force_bypass", False)),
+                "reason": "allowlist_matched",
+            }
+
+    return {
+        "enabled": True,
+        "allowed": False,
+        "matched_pattern": None,
+        "on_miss": pol.get("on_miss"),
+        "force_bypass": bool(pol.get("force_bypass", False)),
+        "reason": "allowlist_miss",
+    }
+
+
+def _is_autovacuum_query(query: Any) -> bool:
+    q = str(query or "").strip().lower()
+    return q.startswith("autovacuum:")
+
+
+def _current_database_oid_sql() -> str:
+    return "(select oid from pg_database where datname = current_database())"
+
+
+def get_vacuum_progress_rows(pg: pg_client, relid: int) -> List[Dict[str, Any]]:
+    """Best-effort pg_stat_progress_vacuum lookup (returns [] if unsupported)."""
+    sql = f"""
+    select
+        a.pid,
+        a.usename,
+        a.application_name,
+        a.client_addr::text as client_addr,
+        a.state,
+        a.wait_event_type,
+        a.wait_event,
+        left(a.query, 400) as query,
+        p.phase
+    from pg_stat_progress_vacuum p
+    join pg_stat_activity a on a.pid = p.pid
+    where p.relid = %s
+      and p.datid = {_current_database_oid_sql()};
+    """
+    try:
+        return json_safe(pg.fetchall(sql, (relid,)))
+    except Exception:
+        return []
+
+
+def get_analyze_progress_rows(pg: pg_client, relid: int) -> List[Dict[str, Any]]:
+    """Best-effort pg_stat_progress_analyze lookup (returns [] if unsupported)."""
+    sql = f"""
+    select
+        a.pid,
+        a.usename,
+        a.application_name,
+        a.client_addr::text as client_addr,
+        a.state,
+        a.wait_event_type,
+        a.wait_event,
+        left(a.query, 400) as query,
+        p.phase
+    from pg_stat_progress_analyze p
+    join pg_stat_activity a on a.pid = p.pid
+    where p.relid = %s
+      and p.datid = {_current_database_oid_sql()};
+    """
+    try:
+        return json_safe(pg.fetchall(sql, (relid,)))
+    except Exception:
+        return []
+
+
+def get_cluster_progress_rows(pg: pg_client, relid: int) -> List[Dict[str, Any]]:
+    """Best-effort pg_stat_progress_cluster lookup (VACUUM FULL/CLUSTER)."""
+    sql = f"""
+    select
+        a.pid,
+        a.usename,
+        a.application_name,
+        a.client_addr::text as client_addr,
+        a.state,
+        a.wait_event_type,
+        a.wait_event,
+        left(a.query, 400) as query,
+        p.command,
+        p.phase
+    from pg_stat_progress_cluster p
+    join pg_stat_activity a on a.pid = p.pid
+    where p.relid = %s
+      and p.datid = {_current_database_oid_sql()};
+    """
+    try:
+        return json_safe(pg.fetchall(sql, (relid,)))
+    except Exception:
+        return []
+
+
+def relation_lock_overview(pg: pg_client, relid: int, sample_limit: int = 10) -> Dict[str, Any]:
+    """Best-effort relation lock snapshot for debugging lock contention."""
+    try:
+        db_oid_sql = _current_database_oid_sql()
+        row = pg.fetchone(
+            f"""
+            select
+                count(*) as lock_count,
+                count(*) filter (where granted) as granted_count,
+                count(*) filter (where not granted) as waiting_count
+            from pg_locks
+            where relation = %s
+              and database = {db_oid_sql}
+              and pid <> pg_backend_pid();
+            """,
+            (relid,),
+        )
+        if not row:
+            return {"lock_count": 0, "granted_count": 0, "waiting_count": 0, "sample": []}
+
+        row = json_safe(row)
+
+        sample_sql = f"""
+        select
+            l.pid,
+            l.mode,
+            l.granted,
+            a.usename,
+            a.application_name,
+            a.client_addr::text as client_addr,
+            a.state,
+            a.wait_event_type,
+            a.wait_event,
+            a.xact_start,
+            a.query_start,
+            left(a.query, 400) as query
+        from pg_locks l
+        left join pg_stat_activity a on a.pid = l.pid
+        where l.relation = %s
+          and l.database = {db_oid_sql}
+          and l.pid <> pg_backend_pid()
+        order by l.granted desc, l.mode
+        limit {int(sample_limit)};
+        """
+        sample: List[Dict[str, Any]] = []
+        try:
+            sample = json_safe(pg.fetchall(sample_sql, (relid,)))
+        except Exception:
+            sample = []
+
+        return {
+            "lock_count": int(row.get("lock_count") or 0),
+            "granted_count": int(row.get("granted_count") or 0),
+            "waiting_count": int(row.get("waiting_count") or 0),
+            "sample": sample,
+        }
+    except Exception:
+        return {"lock_count": 0, "granted_count": 0, "waiting_count": 0, "sample": []}
+
+
+def precheck_task(pg: pg_client, task: action_task, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort precheck:
+      - if autovacuum/vacuum/analyze is already running on the same relation, SKIP.
+      - for VACUUM FULL, optionally SKIP when any lock exists on the relation.
+    """
+    pcfg = get_precheck_cfg(cfg)
+    if not pcfg.get("enabled", False):
+        return {"skip": False, "reason": "", "details": {}}
+
+    c = task.candidate
+    action = str(task.action or "").upper().strip()
+    details: Dict[str, Any] = {}
+
+    if action in ("VACUUM_ANALYZE", "VACUUM_FREEZE_ANALYZE"):
+        rows = get_vacuum_progress_rows(pg, int(c.relid))
+        if rows:
+            details = {"view": "pg_stat_progress_vacuum", "rows": json_safe(rows[:5])}
+            if pcfg.get("skip_if_autovacuum_running", True) and any(_is_autovacuum_query(r.get("query")) for r in rows):
+                return {"skip": True, "reason": "autovacuum_running", "details": details}
+            if pcfg.get("skip_if_vacuum_running", False):
+                return {"skip": True, "reason": "vacuum_running", "details": details}
+
+    if action == "ANALYZE":
+        rows = get_analyze_progress_rows(pg, int(c.relid))
+        if rows:
+            details = {"view": "pg_stat_progress_analyze", "rows": json_safe(rows[:5])}
+            if pcfg.get("skip_if_autovacuum_running", True) and any(_is_autovacuum_query(r.get("query")) for r in rows):
+                return {"skip": True, "reason": "autoanalyze_running", "details": details}
+            if pcfg.get("skip_if_analyze_running", False):
+                return {"skip": True, "reason": "analyze_running", "details": details}
+
+    if action == "VACUUM_FULL_ANALYZE":
+        rows = get_cluster_progress_rows(pg, int(c.relid))
+        if rows:
+            details = {"view": "pg_stat_progress_cluster", "rows": json_safe(rows[:5])}
+            if pcfg.get("skip_if_autovacuum_running", True) and any(_is_autovacuum_query(r.get("query")) for r in rows):
+                return {"skip": True, "reason": "autovacuum_running", "details": details}
+            return {"skip": True, "reason": "vacuum_full_or_cluster_running", "details": details}
+
+        if pcfg.get("skip_vacuum_full_if_relation_locked", True):
+            lk = relation_lock_overview(pg, int(c.relid))
+            if int(lk.get("lock_count") or 0) > 0:
+                return {"skip": True, "reason": "relation_locked", "details": {"locks": lk}}
+
+    return {"skip": False, "reason": "", "details": {}}
+
+
+# -----------------------------
+# Report helpers (Slack/Telegram summary)
+# -----------------------------
+
+def _one_line(s: Any, max_len: int = 220) -> str:
+    """Render text into a single line and truncate to max_len."""
+    if s is None:
+        return ""
+    t = str(s).replace("\n", " ").replace("\r", " ").strip()
+    if len(t) > max_len:
+        return t[: max_len - 3] + "..."
+    return t
+
+
+def _fmt_elapsed_ms(ms: Any) -> str:
+    """Format elapsed milliseconds into human-friendly string."""
+    try:
+        v = int(ms)
+    except Exception:
+        return ""
+    if v < 1000:
+        return f"{v}ms"
+    return f"{round(v / 1000.0, 2)}s"
+
+
+def _summarize_activity_row_brief(r: Dict[str, Any]) -> str:
+    if not isinstance(r, dict):
+        return ""
+    parts: List[str] = []
+    pid = r.get("pid")
+    if pid:
+        parts.append(f"pid={pid}")
+    user = r.get("usename")
+    if user:
+        parts.append(f"user={user}")
+    app = r.get("application_name")
+    if app:
+        parts.append(f"app={app}")
+    phase = r.get("phase") or r.get("command")
+    if phase:
+        parts.append(f"phase={phase}")
+    mode = r.get("mode")
+    if mode:
+        parts.append(f"mode={mode}")
+    granted = r.get("granted")
+    if granted is True:
+        parts.append("granted")
+    elif granted is False:
+        parts.append("waiting")
+    return " ".join(parts).strip()
+
+
+def _summarize_locks_brief(lk: Dict[str, Any]) -> str:
+    if not isinstance(lk, dict):
+        return ""
+    lock_count = int(lk.get("lock_count") or 0)
+    if lock_count <= 0:
+        return ""
+    granted_count = int(lk.get("granted_count") or 0)
+    waiting_count = int(lk.get("waiting_count") or 0)
+    parts: List[str] = [f"locks={lock_count} granted={granted_count} waiting={waiting_count}"]
+    sample = lk.get("sample") or []
+    if isinstance(sample, list) and sample:
+        s0 = sample[0]
+        if isinstance(s0, dict):
+            brief = _summarize_activity_row_brief(s0)
+            if brief:
+                parts.append(brief)
+    return " ".join(parts).strip()
+
+
+def _summarize_precheck_brief(pre: Dict[str, Any]) -> str:
+    if not isinstance(pre, dict):
+        return ""
+    details = pre.get("details") or {}
+    if isinstance(details, dict):
+        rows = details.get("rows") or []
+        if isinstance(rows, list) and rows:
+            r0 = rows[0]
+            if isinstance(r0, dict):
+                brief = _summarize_activity_row_brief(r0)
+                if brief:
+                    return brief
+        locks = details.get("locks") or None
+        if isinstance(locks, dict):
+            brief = _summarize_locks_brief(locks)
+            if brief:
+                return brief
+    return ""
+
+
+def _summarize_skip_details(action_entry: Dict[str, Any]) -> str:
+    if not isinstance(action_entry, dict):
+        return ""
+    ex = action_entry.get("execution") or {}
+    if not isinstance(ex, dict):
+        return ""
+
+    parts: List[str] = []
+
+    attempts = ex.get("attempts") or []
+    if isinstance(attempts, list) and len(attempts) > 1:
+        parts.append(f"attempts={len(attempts)}")
+
+    pre = ex.get("precheck") or None
+    if isinstance(pre, dict) and bool(pre.get("skip")):
+        brief = _summarize_precheck_brief(pre)
+        if brief:
+            parts.append(brief)
+
+    blockers = ex.get("blockers") or None
+    if isinstance(blockers, dict):
+        brief = _summarize_locks_brief(blockers)
+        if brief:
+            parts.append(brief)
+
+    return "; ".join([p for p in parts if p]).strip()
+
+
+def _summarize_fail_details(action_entry: Dict[str, Any]) -> str:
+    if not isinstance(action_entry, dict):
+        return ""
+    ex = action_entry.get("execution") or {}
+    if not isinstance(ex, dict):
+        return ""
+    parts: List[str] = []
+    cat = ex.get("error_category") or ""
+    if cat:
+        parts.append(f"category={cat}")
+    st = ex.get("sqlstate") or ""
+    if st:
+        parts.append(f"sqlstate={st}")
+    attempts = ex.get("attempts") or []
+    if isinstance(attempts, list) and len(attempts) > 1:
+        parts.append(f"attempts={len(attempts)}")
+    blockers = ex.get("blockers") or None
+    if isinstance(blockers, dict):
+        brief = _summarize_locks_brief(blockers)
+        if brief:
+            parts.append(brief)
+    return " ".join([p for p in parts if p]).strip()
+
+
 def vacuum_worker(
     base_cfg: Dict[str, Any],
     task: action_task,
@@ -860,6 +1539,9 @@ def vacuum_worker(
         "action": task.action,
         "reason": task.reason,
         "ok": False,
+        "status": "FAIL",
+        "skipped": False,
+        "skip_reason": "",
         "skipped_by_stop": False,
     }
 
@@ -868,16 +1550,23 @@ def vacuum_worker(
 
     if not sql:
         entry["ok"] = True
+        entry["status"] = "OK"
         entry["reason"] = "no_sql"
         return entry
 
     if immediate_stop_event.is_set():
         entry["skipped_by_stop"] = True
+        entry["skipped"] = True
+        entry["skip_reason"] = "immediate_stop"
+        entry["status"] = "SKIP"
         entry["reason"] = "immediate_stop"
         return entry
 
     if graceful_stop_event.is_set():
         entry["skipped_by_stop"] = True
+        entry["skipped"] = True
+        entry["skip_reason"] = "graceful_stop"
+        entry["status"] = "SKIP"
         entry["reason"] = "graceful_stop"
         return entry
 
@@ -894,11 +1583,20 @@ def vacuum_worker(
         "ended_at": None,
         "elapsed_ms": None,
         "error": None,
+        "sqlstate": None,
+        "error_category": None,
+        "attempts": [],
+        "precheck": None,
+        "blockers": None,
+        "retry_policy": None,
     }
 
     try:
         if immediate_stop_event.is_set():
             entry["skipped_by_stop"] = True
+            entry["skipped"] = True
+            entry["skip_reason"] = "immediate_stop"
+            entry["status"] = "SKIP"
             entry["reason"] = "immediate_stop"
             return entry
 
@@ -913,16 +1611,158 @@ def vacuum_worker(
             if dry_run:
                 logging.info("[DRY-RUN] db=%s %s", task.dbname, sql)
                 entry["ok"] = True
+                entry["status"] = "OK"
                 return entry
 
             if immediate_stop_event.is_set():
                 entry["skipped_by_stop"] = True
+                entry["skipped"] = True
+                entry["skip_reason"] = "immediate_stop"
+                entry["status"] = "SKIP"
                 entry["reason"] = "immediate_stop"
                 return entry
 
-            logging.info("exec db=%s %s", task.dbname, sql)
-            pg.execute(sql)
-            entry["ok"] = True
+            # Precheck to avoid colliding with autovacuum/ongoing operations
+            pre = precheck_task(pg, task, base_cfg)
+            entry["execution"]["precheck"] = pre
+            if bool(pre.get("skip", False)):
+                entry["skipped"] = True
+                entry["skip_reason"] = str(pre.get("reason") or "precheck_skip")
+                entry["status"] = "SKIP"
+                entry["reason"] = f"precheck:{entry['skip_reason']}"
+                return entry
+
+            timezone_name = str(base_cfg.get("run", {}).get("timezone", "Asia/Seoul"))
+            local_now = now_in_tz(timezone_name)
+
+            retry_cfg = effective_retry_cfg(base_cfg, task.dbname, task.action, local_now)
+            retry_enabled = bool(retry_cfg.get("enabled", True))
+            max_attempts = int(retry_cfg.get("max_attempts", 1) or 1) if retry_enabled else 1
+            base_sleep_ms = int(retry_cfg.get("base_sleep_ms", 250) or 250)
+            max_sleep_ms = int(retry_cfg.get("max_sleep_ms", 5000) or 5000)
+            jitter_ms = int(retry_cfg.get("jitter_ms", 250) or 250)
+            retryable_categories = set(retry_cfg.get("retryable_categories") or [])
+
+            entry["execution"]["retry_policy"] = {
+                "enabled": retry_enabled,
+                "max_attempts": int(max_attempts),
+                "base_sleep_ms": int(base_sleep_ms),
+                "max_sleep_ms": int(max_sleep_ms),
+                "jitter_ms": int(jitter_ms),
+                "retryable_categories": sorted([str(x) for x in retryable_categories]),
+                "overrides_applied": list(retry_cfg.get("overrides_applied") or []),
+            }
+
+            for attempt in range(1, max_attempts + 1):
+                if immediate_stop_event.is_set():
+                    entry["skipped_by_stop"] = True
+                    entry["skipped"] = True
+                    entry["skip_reason"] = "immediate_stop"
+                    entry["status"] = "SKIP"
+                    entry["reason"] = "immediate_stop"
+                    return entry
+
+                attempt_t0 = time.time()
+                attempt_rec: Dict[str, Any] = {
+                    "attempt": attempt,
+                    "started_at": dt.datetime.now().isoformat(),
+                    "ended_at": None,
+                    "elapsed_ms": None,
+                    "ok": False,
+                    "error": None,
+                    "sqlstate": None,
+                    "category": None,
+                    "will_retry": False,
+                    "retry_sleep_ms": None,
+                    "blockers": None,
+                }
+
+                try:
+                    logging.info("exec db=%s attempt=%d/%d %s", task.dbname, attempt, max_attempts, sql)
+                    pg.execute(sql)
+
+                    attempt_rec["ok"] = True
+                    # success: record attempt and clear error metadata
+                    entry["execution"]["attempts"].append(attempt_rec)
+                    entry["execution"]["error"] = None
+                    entry["execution"]["sqlstate"] = None
+                    entry["execution"]["error_category"] = None
+                    entry["execution"]["blockers"] = None
+                    entry["ok"] = True
+                    entry["status"] = "OK"
+                    entry["skipped"] = False
+                    entry["skip_reason"] = ""
+                    return entry
+
+                except Exception as e:
+                    cls = classify_pg_exception(e)
+
+                    attempt_rec["ok"] = False
+                    attempt_rec["error"] = str(e)
+                    attempt_rec["sqlstate"] = cls.get("sqlstate")
+                    attempt_rec["category"] = cls.get("category")
+
+                    # record global execution error info (latest failure)
+                    entry["execution"]["error"] = str(e)
+                    entry["execution"]["sqlstate"] = cls.get("sqlstate")
+                    entry["execution"]["error_category"] = cls.get("category")
+
+                    # Best-effort lock holder snapshot for lock-related categories
+                    if cls.get("category") in ("lock_timeout", "lock_not_available", "deadlock_detected"):
+                        try:
+                            lk = relation_lock_overview(pg, int(c.relid))
+                            attempt_rec["blockers"] = lk
+                            entry["execution"]["blockers"] = lk
+                        except Exception:
+                            pass
+
+                    retryable = bool(cls.get("retryable", False)) and str(cls.get("category") or "") in retryable_categories
+                    can_retry = retry_enabled and retryable and attempt < max_attempts
+
+                    attempt_rec["ended_at"] = dt.datetime.now().isoformat()
+                    attempt_rec["elapsed_ms"] = int((time.time() - attempt_t0) * 1000)
+
+                    entry["execution"]["attempts"].append(attempt_rec)
+
+                    if can_retry:
+                        sleep_ms = _backoff_sleep_ms(attempt, base_sleep_ms, max_sleep_ms, jitter_ms)
+                        attempt_rec["will_retry"] = True
+                        attempt_rec["retry_sleep_ms"] = int(sleep_ms)
+
+                        logging.warning(
+                            "retryable_failure db=%s table=%s.%s action=%s category=%s sqlstate=%s attempt=%d/%d sleep_ms=%d",
+                            task.dbname,
+                            c.schemaname,
+                            c.relname,
+                            task.action,
+                            cls.get("category"),
+                            cls.get("sqlstate"),
+                            attempt,
+                            max_attempts,
+                            sleep_ms,
+                        )
+                        time.sleep(sleep_ms / 1000.0)
+                        continue
+
+                    # no more retry => finalize as SKIP or FAIL
+                    if str(cls.get("status")) == "SKIP":
+                        entry["skipped"] = True
+                        entry["skip_reason"] = str(cls.get("category") or "skipped")
+                        entry["status"] = "SKIP"
+                    else:
+                        entry["ok"] = False
+                        entry["status"] = "FAIL"
+                    return entry
+
+                finally:
+                    if attempt_rec.get("ended_at") is None:
+                        attempt_rec["ended_at"] = dt.datetime.now().isoformat()
+                    if attempt_rec.get("elapsed_ms") is None:
+                        attempt_rec["elapsed_ms"] = int((time.time() - attempt_t0) * 1000)
+
+            # Shouldn't reach here, but if so:
+            entry["status"] = "FAIL"
+            entry["ok"] = False
             return entry
 
     except Exception as e:
@@ -933,13 +1773,19 @@ def vacuum_worker(
             c.relname,
             task.action,
         )
+        entry.setdefault("execution", {})
         entry["execution"]["error"] = str(e)
         entry["ok"] = False
+        entry["status"] = "FAIL"
         return entry
 
     finally:
-        entry["execution"]["ended_at"] = dt.datetime.now().isoformat()
-        entry["execution"]["elapsed_ms"] = int((time.time() - t0) * 1000)
+        try:
+            if "execution" in entry and isinstance(entry["execution"], dict):
+                entry["execution"]["ended_at"] = dt.datetime.now().isoformat()
+                entry["execution"]["elapsed_ms"] = int((time.time() - t0) * 1000)
+        except Exception:
+            pass
         unregister_active_conn(pid)
         global_sem.release()
 
@@ -1004,27 +1850,6 @@ def default_json_out_path(run_cfg: Dict[str, Any], local_now: dt.datetime) -> st
     return os.path.join(out_dir, f"{prefix}_{ts}.json")
 
 
-def _one_line(s: Any, max_len: int = 220) -> str:
-    """Render text into a single line and truncate to max_len."""
-    if s is None:
-        return ""
-    t = str(s).replace("\n", " ").replace("\r", " ").strip()
-    if len(t) > max_len:
-        return t[: max_len - 3] + "..."
-    return t
-
-
-def _fmt_elapsed_ms(ms: Any) -> str:
-    """Format elapsed milliseconds into human-friendly string."""
-    try:
-        v = int(ms)
-    except Exception:
-        return ""
-    if v < 1000:
-        return f"{v}ms"
-    return f"{round(v / 1000.0, 2)}s"
-
-
 def build_notify_text_summary_and_details(
     run_summary: Dict[str, Any],
     json_path: str,
@@ -1037,7 +1862,7 @@ def build_notify_text_summary_and_details(
 
     Structure:
     - Header: global summary
-    - Per DB: planned/ok/fail or skip reason
+    - Per DB: planned/ok/skip/fail or skip reason
     - Per DB details: up to max_actions_per_db actions (failures first)
     - Footer: JSON output path if available
     """
@@ -1048,6 +1873,7 @@ def build_notify_text_summary_and_details(
     g = run_summary.get("global", {}) or {}
     planned = g.get("planned_actions", 0)
     ok = g.get("executed_ok", 0)
+    skip = g.get("executed_skip", 0)
     fail = g.get("executed_fail", 0)
     skipped_dbs = g.get("skipped_dbs", 0)
 
@@ -1061,7 +1887,7 @@ def build_notify_text_summary_and_details(
     lines: List[str] = []
     lines.append(f"[pg_vacman] {mode} {ts} ({timezone_name})")
     lines.append(
-        f"planned={planned} ok={ok} fail={fail} skipped_dbs={skipped_dbs} aborted={aborted}({abort_mode})"
+        f"planned={planned} ok={ok} skip={skip} fail={fail} skipped_dbs={skipped_dbs} aborted={aborted}({abort_mode})"
     )
     lines.append(f"detail={detail} parallel(db={parallel_db}/global={parallel_global})")
 
@@ -1070,6 +1896,7 @@ def build_notify_text_summary_and_details(
         dbname = db.get("db", "")
         db_planned = db.get("planned", 0)
         db_ok = db.get("ok", 0)
+        db_skip = db.get("skip", 0)
         db_fail = db.get("fail", 0)
         skipped_reason = db.get("skipped_reason", "")
 
@@ -1078,18 +1905,21 @@ def build_notify_text_summary_and_details(
             lines.append(f"DB: {dbname} skipped_reason={skipped_reason}")
             continue
 
-        lines.append(f"DB: {dbname} planned={db_planned} ok={db_ok} fail={db_fail}")
+        lines.append(f"DB: {dbname} planned={db_planned} ok={db_ok} skip={db_skip} fail={db_fail}")
 
         actions = db.get("actions", []) or []
 
-        # Sort: FAIL first, then OK, then SKIP (stop-skipped)
+        # Sort: FAIL first, then SKIP, then OK
         def _sort_key(a: Dict[str, Any]) -> Tuple[int, str]:
-            if a.get("skipped_by_stop"):
-                grp = 2
-            elif a.get("ok"):
-                grp = 1
-            else:
-                grp = 0
+            st = str(a.get("status") or "").upper().strip()
+            if st not in allowed_statuses:
+                if a.get("ok"):
+                    st = "OK"
+                elif a.get("skipped") or a.get("skipped_by_stop"):
+                    st = "SKIP"
+                else:
+                    st = "FAIL"
+            grp = {"FAIL": 0, "SKIP": 1, "OK": 2}.get(st, 9)
             return (grp, str(a.get("table", "")))
 
         actions_sorted = sorted(actions, key=_sort_key)
@@ -1101,26 +1931,34 @@ def build_notify_text_summary_and_details(
             if shown >= max_actions_per_db:
                 break
 
-            status = "OK" if a.get("ok") else "FAIL"
-            if a.get("skipped_by_stop"):
-                status = "SKIP"
+            st = str(a.get("status") or "").upper().strip()
+            if st not in allowed_statuses:
+                st = "OK" if a.get("ok") else ("SKIP" if a.get("skipped") or a.get("skipped_by_stop") else "FAIL")
 
             action = a.get("action", "")
             table = a.get("table", "")
             ex = a.get("execution", {}) or {}
             elapsed = _fmt_elapsed_ms(ex.get("elapsed_ms"))
 
-            if status in ("OK", "SKIP"):
+            if st == "OK":
                 msg = _one_line(a.get("reason", ""), 180)
+            elif st == "SKIP":
+                base = a.get("skip_reason") or a.get("reason", "skipped")
+                extra = _summarize_skip_details(a)
+                msg = f"{base} | {extra}" if extra else str(base)
+                msg = _one_line(msg, 180)
             else:
-                err = _one_line(ex.get("error"), 180)
-                msg = err if err else _one_line(a.get("reason", ""), 180)
+                err = _one_line(ex.get("error"), 150)
+                msg = err if err else _one_line(a.get("reason", ""), 150)
+                extra = _summarize_fail_details(a)
+                if extra:
+                    msg = _one_line(f"{msg} ({extra})", 180)
 
-            row = f"{status} | {action} | {table} | {elapsed} | {msg}".rstrip()
+            row = f"{st} | {action} | {table} | {elapsed} | {msg}".rstrip()
 
             if include_sql:
-                sql = _one_line(ex.get("sql", ""), 180)
-                row = f"{row} | {sql}".rstrip()
+                sql_text = _one_line(ex.get("sql", ""), 180)
+                row = f"{row} | {sql_text}".rstrip()
 
             lines.append(row)
             shown += 1
@@ -1211,6 +2049,7 @@ def main() -> int:
         "global": {
             "planned_actions": 0,
             "executed_ok": 0,
+            "executed_skip": 0,
             "executed_fail": 0,
             "skipped_dbs": 0,
             "parallel_tables_per_db": parallel_tables_per_db,
@@ -1267,6 +2106,7 @@ def main() -> int:
                 "db": dbname,
                 "planned": 0,
                 "ok": 0,
+                "skip": 0,
                 "fail": 0,
                 "actions": [],
             }
@@ -1340,6 +2180,25 @@ def main() -> int:
                     },
                 }
 
+                # Guardrails: VACUUM FULL allowlist (optional)
+                if action == "VACUUM_FULL_ANALYZE":
+                    vf_pol = vacuum_full_policy_decision(cfg, dbname, schema, table, force_dec)
+                    decision["guardrails"] = {"vacuum_full_policy": vf_pol, "original_action": "VACUUM_FULL_ANALYZE"}
+
+                    if vf_pol.get("enabled") and not vf_pol.get("allowed"):
+                        on_miss = str(vf_pol.get("on_miss") or "VACUUM_ANALYZE").upper().strip()
+                        if on_miss == "SKIP":
+                            action = "SKIP"
+                            reason = "vacuum_full_not_allowlisted"
+                            source = "guardrails"
+                        else:
+                            action = "VACUUM_ANALYZE"
+                            reason = "vacuum_full_not_allowlisted_downgraded_to_vacuum_analyze"
+                            source = "guardrails"
+
+                        decision["final_action"] = {"action": action, "reason": reason, "source": source}
+                        decision["guardrails"]["final_action"] = action
+
                 if action != "SKIP":
                     plans.append(action_task(dbname=dbname, candidate=c, action=action, reason=reason, decision=decision))
 
@@ -1378,6 +2237,25 @@ def main() -> int:
                     time.sleep(sleep_between_databases_sec)
                 continue
 
+            def _count_result(res: Dict[str, Any]) -> None:
+                st = str(res.get("status") or "").upper().strip()
+                if st not in allowed_statuses:
+                    if res.get("ok"):
+                        st = "OK"
+                    elif res.get("skipped") or res.get("skipped_by_stop"):
+                        st = "SKIP"
+                    else:
+                        st = "FAIL"
+                if st == "OK":
+                    db_report["ok"] += 1
+                    run_summary["global"]["executed_ok"] += 1
+                elif st == "SKIP":
+                    db_report["skip"] += 1
+                    run_summary["global"]["executed_skip"] += 1
+                else:
+                    db_report["fail"] += 1
+                    run_summary["global"]["executed_fail"] += 1
+
             if parallel_tables_per_db == 1:
                 for t in plans:
                     if immediate_stop_event.is_set():
@@ -1387,13 +2265,7 @@ def main() -> int:
 
                     res = vacuum_worker(cfg, t, dry_run, global_sem, json_detail_level)
                     db_report["actions"].append(res)
-
-                    if res.get("ok"):
-                        db_report["ok"] += 1
-                        run_summary["global"]["executed_ok"] += 1
-                    else:
-                        db_report["fail"] += 1
-                        run_summary["global"]["executed_fail"] += 1
+                    _count_result(res)
 
                     if sleep_between_tables_sec > 0:
                         time.sleep(sleep_between_tables_sec)
@@ -1408,23 +2280,18 @@ def main() -> int:
                     for fut in as_completed(futures):
                         res = fut.result()
                         db_report["actions"].append(res)
-
-                        if res.get("ok"):
-                            db_report["ok"] += 1
-                            run_summary["global"]["executed_ok"] += 1
-                        else:
-                            db_report["fail"] += 1
-                            run_summary["global"]["executed_fail"] += 1
+                        _count_result(res)
 
                         if sleep_between_tables_sec > 0:
                             time.sleep(sleep_between_tables_sec)
 
             run_summary["db_results"].append(db_report)
             logging.info(
-                "db_end=%s planned=%d ok=%d fail=%d",
+                "db_end=%s planned=%d ok=%d skip=%d fail=%d",
                 dbname,
                 db_report["planned"],
                 db_report["ok"],
+                db_report["skip"],
                 db_report["fail"],
             )
 

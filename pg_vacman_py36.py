@@ -2,29 +2,30 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-pg_vacman v1.0 (py3.6-compatible): PostgreSQL maintenance manager (multi-database VACUUM/ANALYZE runner)
+pg_vacman v1.1 (py3.6-compatible): PostgreSQL maintenance manager (multi-database VACUUM/ANALYZE runner)
 
-This version is adjusted to run on older environments such as:
-- Linux 7.x (e.g., RHEL/CentOS 7)
-- Python 3.6
-- OpenSSL 1.0.2k (as used by Python's ssl module / system libpq on older distros)
+Target legacy environments:
+- RHEL/CentOS 7.x + Python 3.6
+- Older OpenSSL/libssl environments where urllib3 v2 can break
 
-Key compatibility changes vs the original 3.7+/OpenSSL 1.1.1+ assumption:
-- No hard dependency on `requests` (optional). Notifications fall back to stdlib `urllib`.
-  This avoids common issues with urllib3 v2 requiring OpenSSL 1.1.1+. (See urllib3 2.x migration guide.)
-- No hard dependency on `dataclasses` (uses typing.NamedTuple instead).
-- Uses psycopg2 only (psycopg3 is not required and commonly unavailable on Python 3.6).
+Compatibility choices:
+- psycopg2 only
+- No required dependency on requests (optional; falls back to stdlib urllib)
+- No dataclasses (uses typing.NamedTuple)
 
-Dependencies (recommended pins for Python 3.6)
-- psycopg2-binary==2.9.6  (last series with cp36 wheels commonly used on RHEL7/CentOS7)
-- PyYAML==6.0.1          (6.0.2+ requires Python >=3.8)
-- requests==2.27.1       (optional; script falls back to stdlib urllib if not installed)
+New v1.1 features (also in this py3.6 build):
+- Precheck: skip when autovacuum/vacuum/analyze is already running on the same table (best-effort)
+- VACUUM FULL guardrail (allowlist + downgrade/skip)
+- Retry/backoff on retryable failures (lock timeout, statement timeout, deadlock, etc.)
+- Run report counts: OK / FAIL / SKIP separated
 
-Example (pip):
+Dependencies (recommended pins for Python 3.6):
+- psycopg2-binary==2.9.6
+- PyYAML==6.0.1
+- requests==2.27.1 (optional; safe choice to avoid urllib3 v2 on old OpenSSL)
+
+Example:
   python3.6 -m pip install -r requirements_py36.txt
-
-Notes
-- Requires sufficient privileges to run maintenance commands.
 """
 
 import argparse
@@ -33,6 +34,7 @@ import fnmatch
 import json
 import logging
 import os
+import random
 import signal
 import sys
 import threading
@@ -66,7 +68,7 @@ immediate_stop_event = threading.Event()
 
 # Track active DB connections (for cancellation on immediate stop).
 active_conns_lock = threading.Lock()
-active_conns: Dict[int, Any] = {}  # backend_pid -> connection object
+active_conns = {}  # type: Dict[int, Any]  # backend_pid -> connection object
 
 sigint_count_lock = threading.Lock()
 sigint_count = 0
@@ -211,7 +213,7 @@ def load_config(path: str) -> Dict[str, Any]:
     Load configuration.
 
     - If file ends with .json: parse JSON (no extra deps)
-    - Otherwise: parse YAML via PyYAML (pip install PyYAML==5.4.1 recommended for py3.6)
+    - Otherwise: parse YAML via PyYAML (PyYAML==6.0.1 recommended for py3.6)
     """
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
@@ -223,7 +225,7 @@ def load_config(path: str) -> Dict[str, Any]:
         import yaml  # type: ignore
     except Exception as e:
         raise RuntimeError(
-            "PyYAML is required to read YAML config. Install PyYAML==5.4.1 (recommended for Python 3.6). "
+            "PyYAML is required to read YAML config. Install PyYAML==6.0.1 (recommended for Python 3.6). "
             "Original error: {err}".format(err=e)
         )
 
@@ -328,7 +330,6 @@ def age_hours(ts: Optional[dt.datetime], now: dt.datetime) -> Optional[float]:
 def _urllib_post(url: str, data: bytes, headers: Dict[str, str], timeout: int = 5) -> None:
     """POST helper using stdlib urllib (no external deps)."""
     try:
-        # py3.6: urllib.request available
         import urllib.request
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as _:
@@ -422,7 +423,7 @@ def apply_session_settings(pg: pg_client, cfg: Dict[str, Any]) -> None:
     lock_timeout_ms = int(limits_cfg.get("lock_timeout_ms", 2000) or 2000)
     statement_timeout_ms = int(limits_cfg.get("per_table_statement_timeout_sec", 1800) or 1800) * 1000
 
-    # Some very old PostgreSQL versions may not support lock_timeout; ignore if setting fails.
+    # Some old PostgreSQL versions may not support certain settings; ignore if setting fails.
     try:
         pg.execute("set lock_timeout = %s;", ("{ms}ms".format(ms=lock_timeout_ms),))
     except Exception:
@@ -811,7 +812,11 @@ def decide_action_verbose(c: table_candidate, cfg: Dict[str, Any], local_now: dt
         start_hhmm = str(vacuum_full_cfg.get("start", "01:00"))
         end_hhmm = str(vacuum_full_cfg.get("end", "05:00"))
 
-        if c.dead_ratio >= full_min_dead_ratio and size_mb >= full_min_size_mb and in_time_window(local_now, start_hhmm, end_hhmm):
+        if (
+            c.dead_ratio >= full_min_dead_ratio
+            and size_mb >= full_min_size_mb
+            and in_time_window(local_now, start_hhmm, end_hhmm)
+        ):
             th_dec["rule"] = "vacuum_full enabled and conditions met => VACUUM_FULL_ANALYZE"
             return "VACUUM_FULL_ANALYZE", "VACUUM FULL conditions and time window satisfied", th_dec
 
@@ -830,8 +835,73 @@ def decide_action_verbose(c: table_candidate, cfg: Dict[str, Any], local_now: dt
     return "SKIP", "thresholds not met", th_dec
 
 
+def _vacuum_full_policy_adjust(
+    cfg: Dict[str, Any],
+    dbname: str,
+    schema: str,
+    table: str,
+    action: str,
+    force_matched: bool,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Apply vacuum_full_policy guardrail.
+
+    Returns:
+      (possibly_adjusted_action, policy_decision_dict)
+    """
+    pol = cfg.get("vacuum_full_policy", {}) or {}
+    enabled = bool(pol.get("enabled", False))
+
+    dec = {
+        "enabled": enabled,
+        "applied": False,
+        "allow_hit": None,
+        "on_miss": None,
+        "force_bypass": bool(pol.get("force_bypass", False)),
+        "result": None,
+        "reason": None,
+    }  # type: Dict[str, Any]
+
+    if not enabled:
+        return action, dec
+
+    if action != "VACUUM_FULL_ANALYZE":
+        return action, dec
+
+    if force_matched and bool(pol.get("force_bypass", False)):
+        dec["applied"] = True
+        dec["result"] = "allow"
+        dec["reason"] = "force_bypass"
+        return action, dec
+
+    allow_objects = pol.get("allow_objects") or []
+    for pat in allow_objects:
+        if match_object_pattern(dbname, schema, table, str(pat)):
+            dec["applied"] = True
+            dec["allow_hit"] = str(pat)
+            dec["result"] = "allow"
+            dec["reason"] = "allowlisted"
+            return action, dec
+
+    on_miss = str(pol.get("on_miss", "VACUUM_ANALYZE")).upper().strip()
+    if on_miss not in ("VACUUM_ANALYZE", "SKIP"):
+        on_miss = "VACUUM_ANALYZE"
+
+    dec["applied"] = True
+    dec["on_miss"] = on_miss
+
+    if on_miss == "SKIP":
+        dec["result"] = "skip"
+        dec["reason"] = "not_allowlisted"
+        return "SKIP", dec
+
+    dec["result"] = "downgrade"
+    dec["reason"] = "not_allowlisted"
+    return "VACUUM_ANALYZE", dec
+
+
 def make_maintenance_sql(schema: str, table: str, action: str) -> str:
-    """Build SQL for the demonstrated maintenance action."""
+    """Build SQL for the maintenance action."""
     target = fqtn(schema, table)
 
     if action == "ANALYZE":
@@ -912,6 +982,284 @@ def cancel_all_active_conns() -> None:
             pass
 
 
+def _safe_lower(s: Any) -> str:
+    try:
+        return str(s).lower()
+    except Exception:
+        return ""
+
+
+def classify_sql_exception(exc: Exception) -> Dict[str, Any]:
+    """
+    Classify common PostgreSQL errors into retry categories.
+    Best-effort based on pgcode + message text.
+    """
+    pgcode = getattr(exc, "pgcode", None)
+    msg = _safe_lower(exc)
+
+    # Important: lock_timeout/statement_timeout often share pgcode=57014 (query_canceled),
+    # so detect them by message text first.
+    if "canceling statement due to lock timeout" in msg or "lock timeout" in msg:
+        cat = "lock_timeout"
+    elif "canceling statement due to statement timeout" in msg or "statement timeout" in msg:
+        cat = "statement_timeout"
+    elif pgcode == "40P01" or "deadlock detected" in msg:
+        cat = "deadlock_detected"
+    elif pgcode == "40001" or "could not serialize access" in msg or "serialization failure" in msg:
+        cat = "serialization_failure"
+    elif pgcode == "55P03" or "lock not available" in msg or "could not obtain lock" in msg:
+        cat = "lock_not_available"
+    elif pgcode == "57014" or "canceling statement due to user request" in msg or "query canceled" in msg:
+        cat = "query_canceled"
+    else:
+        cat = "other"
+
+    return {
+        "category": cat,
+        "pgcode": pgcode,
+        "message": str(exc),
+    }
+
+
+def _retry_policy_for_task(cfg: Dict[str, Any], dbname: str, action: str, local_now: dt.datetime) -> Dict[str, Any]:
+    """
+    Compute effective retry policy for a task, applying overrides in order.
+    """
+    base = cfg.get("retry", {}) or {}
+
+    pol = {
+        "enabled": bool(base.get("enabled", False)),
+        "max_attempts": int(base.get("max_attempts", 1) or 1),
+        "base_sleep_ms": int(base.get("base_sleep_ms", 200) or 200),
+        "max_sleep_ms": int(base.get("max_sleep_ms", 5000) or 5000),
+        "jitter_ms": int(base.get("jitter_ms", 0) or 0),
+        "retryable_categories": list(base.get("retryable_categories") or []),
+    }  # type: Dict[str, Any]
+
+    overrides = base.get("overrides") or []
+    for ov in overrides:
+        if not isinstance(ov, dict):
+            continue
+
+        db_pat = str(ov.get("db_pattern", "*") or "*")
+        if not fnmatch.fnmatchcase(dbname, db_pat):
+            continue
+
+        act_pat = str(ov.get("action_pattern", "*") or "*")
+        if act_pat and not fnmatch.fnmatchcase(action, act_pat):
+            continue
+
+        start = ov.get("start")
+        end = ov.get("end")
+        if start is not None and end is not None:
+            try:
+                if not in_time_window(local_now, str(start), str(end)):
+                    continue
+            except Exception:
+                continue
+
+        # Apply override fields
+        if "enabled" in ov:
+            pol["enabled"] = bool(ov.get("enabled", False))
+        if "max_attempts" in ov:
+            pol["max_attempts"] = int(ov.get("max_attempts", pol["max_attempts"]) or pol["max_attempts"])
+        if "base_sleep_ms" in ov:
+            pol["base_sleep_ms"] = int(ov.get("base_sleep_ms", pol["base_sleep_ms"]) or pol["base_sleep_ms"])
+        if "max_sleep_ms" in ov:
+            pol["max_sleep_ms"] = int(ov.get("max_sleep_ms", pol["max_sleep_ms"]) or pol["max_sleep_ms"])
+        if "jitter_ms" in ov:
+            pol["jitter_ms"] = int(ov.get("jitter_ms", pol["jitter_ms"]) or pol["jitter_ms"])
+        if "retryable_categories" in ov and isinstance(ov.get("retryable_categories"), list):
+            pol["retryable_categories"] = list(ov.get("retryable_categories") or pol["retryable_categories"])
+
+    # Normalize
+    if not pol.get("enabled", False):
+        pol["enabled"] = False
+        pol["max_attempts"] = 1
+
+    try:
+        pol["max_attempts"] = max(1, int(pol.get("max_attempts", 1)))
+    except Exception:
+        pol["max_attempts"] = 1
+
+    try:
+        pol["base_sleep_ms"] = max(0, int(pol.get("base_sleep_ms", 0)))
+    except Exception:
+        pol["base_sleep_ms"] = 0
+
+    try:
+        pol["max_sleep_ms"] = max(0, int(pol.get("max_sleep_ms", 0)))
+    except Exception:
+        pol["max_sleep_ms"] = 0
+
+    try:
+        pol["jitter_ms"] = max(0, int(pol.get("jitter_ms", 0)))
+    except Exception:
+        pol["jitter_ms"] = 0
+
+    if pol["max_sleep_ms"] < pol["base_sleep_ms"]:
+        pol["max_sleep_ms"] = pol["base_sleep_ms"]
+
+    return pol
+
+
+def _precheck_progress_vacuum_rows(pg: pg_client, relid: int) -> List[Dict[str, Any]]:
+    """
+    Best-effort fetch rows from pg_stat_progress_vacuum joined with pg_stat_activity.
+    If view is unavailable or permissions are insufficient, returns [].
+    """
+    try:
+        sql = """
+        select a.pid, a.query
+        from pg_stat_progress_vacuum p
+        join pg_stat_activity a on a.pid = p.pid
+        where p.relid = %s
+          and a.pid <> pg_backend_pid();
+        """
+        return pg.fetchall(sql, (relid,))
+    except Exception:
+        return []
+
+
+def _precheck_activity_match(pg: pg_client, like_prefix: str, schema: str, table: str) -> bool:
+    """
+    Best-effort fallback using pg_stat_activity query text matching.
+    """
+    try:
+        sql = """
+        select 1 as ok
+        from pg_stat_activity
+        where pid <> pg_backend_pid()
+          and state <> 'idle'
+          and query ilike %s
+          and query ilike %s
+          and query ilike %s
+        limit 1;
+        """
+        row = pg.fetchone(sql, (like_prefix, "%{s}%".format(s=schema), "%{t}%".format(t=table)))
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _precheck_relation_locked(pg: pg_client, relid: int) -> bool:
+    """
+    Return True if there is any granted lock on the relation by other backends.
+    (Used as a conservative guard for VACUUM FULL.)
+    """
+    try:
+        sql = """
+        select 1 as ok
+        from pg_locks l
+        where l.relation = %s
+          and l.pid <> pg_backend_pid()
+          and l.granted = true
+        limit 1;
+        """
+        row = pg.fetchone(sql, (relid,))
+        return bool(row)
+    except Exception:
+        return False
+
+
+def precheck_should_skip(
+    pg: pg_client,
+    cfg: Dict[str, Any],
+    task: action_task,
+    action: str,
+) -> Dict[str, Any]:
+    """
+    Best-effort precheck before executing a maintenance action.
+
+    Returns dict:
+      { "enabled": bool, "skip": bool, "skip_reason": str, "details": {...} }
+    """
+    pre = cfg.get("precheck", {}) or {}
+    enabled = bool(pre.get("enabled", False))
+
+    out = {
+        "enabled": enabled,
+        "skip": False,
+        "skip_reason": "",
+        "details": {},
+    }  # type: Dict[str, Any]
+
+    if not enabled:
+        return out
+
+    c = task.candidate
+    schema = c.schemaname
+    table = c.relname
+    relid = int(c.relid)
+
+    skip_if_autovacuum_running = bool(pre.get("skip_if_autovacuum_running", False))
+    skip_if_vacuum_running = bool(pre.get("skip_if_vacuum_running", False))
+    skip_if_analyze_running = bool(pre.get("skip_if_analyze_running", False))
+    skip_vacuum_full_if_relation_locked = bool(pre.get("skip_vacuum_full_if_relation_locked", False))
+
+    # 1) VACUUM FULL conservative lock check
+    if action == "VACUUM_FULL_ANALYZE" and skip_vacuum_full_if_relation_locked:
+        locked = _precheck_relation_locked(pg, relid)
+        out["details"]["vacuum_full_relation_locked"] = locked
+        if locked:
+            out["skip"] = True
+            out["skip_reason"] = "precheck:relation_locked_for_vacuum_full"
+            return out
+
+    # 2) Prefer pg_stat_progress_vacuum (covers vacuum/autovacuum in progress)
+    rows = _precheck_progress_vacuum_rows(pg, relid)
+    if rows:
+        is_autovac = False
+        is_vac = False
+        for r in rows:
+            q = _safe_lower(r.get("query", ""))
+            if q.startswith("autovacuum:"):
+                is_autovac = True
+            else:
+                is_vac = True
+
+        out["details"]["progress_vacuum_rows"] = len(rows)
+        out["details"]["autovacuum_running"] = is_autovac
+        out["details"]["vacuum_running"] = is_vac
+
+        if skip_if_autovacuum_running and is_autovac:
+            out["skip"] = True
+            out["skip_reason"] = "precheck:autovacuum_running"
+            return out
+
+        if skip_if_vacuum_running and is_vac:
+            out["skip"] = True
+            out["skip_reason"] = "precheck:vacuum_running"
+            return out
+
+    # 3) Fallback: pg_stat_activity query-text matching (best-effort)
+    if skip_if_autovacuum_running:
+        hit = _precheck_activity_match(pg, "autovacuum:%", schema, table)
+        out["details"]["autovacuum_activity_match"] = hit
+        if hit:
+            out["skip"] = True
+            out["skip_reason"] = "precheck:autovacuum_running(activity)"
+            return out
+
+    if skip_if_vacuum_running:
+        hit = _precheck_activity_match(pg, "vacuum%", schema, table)
+        out["details"]["vacuum_activity_match"] = hit
+        if hit:
+            out["skip"] = True
+            out["skip_reason"] = "precheck:vacuum_running(activity)"
+            return out
+
+    if skip_if_analyze_running:
+        hit = _precheck_activity_match(pg, "analyze%", schema, table)
+        out["details"]["analyze_activity_match"] = hit
+        if hit:
+            out["skip"] = True
+            out["skip_reason"] = "precheck:analyze_running(activity)"
+            return out
+
+    return out
+
+
 def vacuum_worker(
     base_cfg: Dict[str, Any],
     task: action_task,
@@ -932,6 +1280,7 @@ def vacuum_worker(
         "action": task.action,
         "reason": task.reason,
         "ok": False,
+        "skipped": False,
         "skipped_by_stop": False,
     }
 
@@ -944,16 +1293,32 @@ def vacuum_worker(
         return entry
 
     if immediate_stop_event.is_set():
+        entry["skipped"] = True
         entry["skipped_by_stop"] = True
         entry["reason"] = "immediate_stop"
         return entry
 
     if graceful_stop_event.is_set():
+        entry["skipped"] = True
         entry["skipped_by_stop"] = True
         entry["reason"] = "graceful_stop"
         return entry
 
-    global_sem.acquire()
+    # Acquire global semaphore with short timeouts so stop signals can break quickly.
+    acquired = False
+    while not acquired:
+        if immediate_stop_event.is_set():
+            entry["skipped"] = True
+            entry["skipped_by_stop"] = True
+            entry["reason"] = "immediate_stop"
+            return entry
+        if graceful_stop_event.is_set():
+            entry["skipped"] = True
+            entry["skipped_by_stop"] = True
+            entry["reason"] = "graceful_stop"
+            return entry
+        acquired = global_sem.acquire(timeout=0.5)
+
     pid = None  # type: Optional[int]
     started_at = dt.datetime.now().isoformat()
     t0 = time.time()
@@ -966,10 +1331,12 @@ def vacuum_worker(
         "ended_at": None,
         "elapsed_ms": None,
         "error": None,
+        "attempts": [],
     }
 
     try:
         if immediate_stop_event.is_set():
+            entry["skipped"] = True
             entry["skipped_by_stop"] = True
             entry["reason"] = "immediate_stop"
             return entry
@@ -977,24 +1344,116 @@ def vacuum_worker(
         db_cfg = cfg_for_db(base_cfg, task.dbname)
         db_cfg = cfg_with_application_suffix(db_cfg, "worker")
 
+        # For override time windows, use run.timezone
+        timezone_name = str((base_cfg.get("run", {}) or {}).get("timezone", "Asia/Seoul"))
+        local_now = now_in_tz(timezone_name)
+
+        retry_pol = _retry_policy_for_task(base_cfg, task.dbname, task.action, local_now)
+
         with pg_client(db_cfg, context="worker:{db}".format(db=task.dbname)) as pg:
             apply_session_settings(pg, base_cfg)
             pid = register_active_conn(pg)
             entry["execution"]["backend_pid"] = pid
+
+            # Precheck
+            precheck_res = precheck_should_skip(pg, base_cfg, task, task.action)
+            if json_detail_level == "verbose":
+                entry["precheck"] = precheck_res
+
+            if precheck_res.get("skip", False):
+                entry["skipped"] = True
+                entry["reason"] = str(precheck_res.get("skip_reason", "precheck_skip"))
+                return entry
 
             if dry_run:
                 logging.info("[DRY-RUN] db=%s %s", task.dbname, sql)
                 entry["ok"] = True
                 return entry
 
-            if immediate_stop_event.is_set():
-                entry["skipped_by_stop"] = True
-                entry["reason"] = "immediate_stop"
-                return entry
+            # Retry loop
+            max_attempts = int(retry_pol.get("max_attempts", 1) or 1)
+            retryable = set([str(x) for x in (retry_pol.get("retryable_categories") or [])])
 
-            logging.info("exec db=%s %s", task.dbname, sql)
-            pg.execute(sql)
-            entry["ok"] = True
+            for attempt in range(1, max_attempts + 1):
+                if immediate_stop_event.is_set():
+                    entry["skipped"] = True
+                    entry["skipped_by_stop"] = True
+                    entry["reason"] = "immediate_stop"
+                    return entry
+                if graceful_stop_event.is_set():
+                    entry["skipped"] = True
+                    entry["skipped_by_stop"] = True
+                    entry["reason"] = "graceful_stop"
+                    return entry
+
+                try:
+                    logging.info("exec db=%s %s", task.dbname, sql)
+                    pg.execute(sql)
+
+                    entry["execution"]["attempts"].append(
+                        {"attempt": attempt, "ok": True, "category": None, "sleep_ms": 0, "error": None}
+                    )
+                    entry["ok"] = True
+                    return entry
+
+                except Exception as e:
+                    info = classify_sql_exception(e)
+                    cat = str(info.get("category", "other"))
+                    err_txt = str(e)
+
+                    sleep_ms = 0
+                    will_retry = False
+
+                    if attempt < max_attempts and (cat in retryable):
+                        # backoff: base * 2^(attempt-1)
+                        base_sleep = int(retry_pol.get("base_sleep_ms", 0) or 0)
+                        max_sleep = int(retry_pol.get("max_sleep_ms", base_sleep) or base_sleep)
+                        jitter = int(retry_pol.get("jitter_ms", 0) or 0)
+
+                        raw = base_sleep * (2 ** (attempt - 1))
+                        sleep_ms = min(max_sleep, raw)
+
+                        if jitter > 0:
+                            sleep_ms = sleep_ms + random.randint(-jitter, jitter)
+                            if sleep_ms < 0:
+                                sleep_ms = 0
+
+                        will_retry = True
+
+                    entry["execution"]["attempts"].append(
+                        {
+                            "attempt": attempt,
+                            "ok": False,
+                            "category": cat,
+                            "sleep_ms": sleep_ms,
+                            "error": err_txt,
+                            "pgcode": info.get("pgcode"),
+                        }
+                    )
+
+                    if not will_retry:
+                        entry["execution"]["error"] = err_txt
+                        entry["ok"] = False
+                        return entry
+
+                    logging.warning(
+                        "retryable_error db=%s table=%s.%s action=%s attempt=%d/%d category=%s sleep_ms=%d err=%s",
+                        task.dbname,
+                        c.schemaname,
+                        c.relname,
+                        task.action,
+                        attempt,
+                        max_attempts,
+                        cat,
+                        sleep_ms,
+                        err_txt,
+                    )
+
+                    time.sleep(sleep_ms / 1000.0)
+
+            # Should not reach here
+            entry["execution"]["error"] = entry["execution"].get("error") or "retry_exhausted"
+            entry["ok"] = False
             return entry
 
     except Exception as e:
@@ -1013,7 +1472,8 @@ def vacuum_worker(
         entry["execution"]["ended_at"] = dt.datetime.now().isoformat()
         entry["execution"]["elapsed_ms"] = int((time.time() - t0) * 1000)
         unregister_active_conn(pid)
-        global_sem.release()
+        if acquired:
+            global_sem.release()
 
 
 def resolve_run_mode(args: argparse.Namespace, cfg: Dict[str, Any]) -> bool:
@@ -1022,7 +1482,7 @@ def resolve_run_mode(args: argparse.Namespace, cfg: Dict[str, Any]) -> bool:
         return False
     if args.dry_run:
         return True
-    return bool(cfg.get("run", {}).get("dry_run_default", True))
+    return bool((cfg.get("run", {}) or {}).get("dry_run_default", True))
 
 
 def install_signal_handlers() -> None:
@@ -1111,7 +1571,7 @@ def build_notify_text_summary_and_details(
 
     Structure:
     - Header: global summary
-    - Per DB: planned/ok/fail or skip reason
+    - Per DB: planned/ok/fail/skip or skip reason
     - Per DB details: up to max_actions_per_db actions (failures first)
     - Footer: JSON output path if available
     """
@@ -1123,6 +1583,7 @@ def build_notify_text_summary_and_details(
     planned = g.get("planned_actions", 0)
     ok = g.get("executed_ok", 0)
     fail = g.get("executed_fail", 0)
+    skip = g.get("executed_skip", 0)
     skipped_dbs = g.get("skipped_dbs", 0)
 
     aborted = bool(run_summary.get("aborted", False))
@@ -1135,11 +1596,13 @@ def build_notify_text_summary_and_details(
     lines = []  # type: List[str]
     lines.append("[pg_vacman] {mode} {ts} ({tz})".format(mode=mode, ts=ts, tz=timezone_name))
     lines.append(
-        "planned={planned} ok={ok} fail={fail} skipped_dbs={skipped} aborted={aborted}({abort_mode})".format(
-            planned=planned, ok=ok, fail=fail, skipped=skipped_dbs, aborted=aborted, abort_mode=abort_mode
+        "planned={planned} ok={ok} fail={fail} skip={skip} skipped_dbs={skipped} aborted={aborted}({abort_mode})".format(
+            planned=planned, ok=ok, fail=fail, skip=skip, skipped=skipped_dbs, aborted=aborted, abort_mode=abort_mode
         )
     )
-    lines.append("detail={detail} parallel(db={pdb}/global={pgl})".format(detail=detail, pdb=parallel_db, pgl=parallel_global))
+    lines.append(
+        "detail={detail} parallel(db={pdb}/global={pgl})".format(detail=detail, pdb=parallel_db, pgl=parallel_global)
+    )
 
     db_results = run_summary.get("db_results", []) or []
     for db in db_results:
@@ -1147,6 +1610,7 @@ def build_notify_text_summary_and_details(
         db_planned = db.get("planned", 0)
         db_ok = db.get("ok", 0)
         db_fail = db.get("fail", 0)
+        db_skip = db.get("skip", 0)
         skipped_reason = db.get("skipped_reason", "")
 
         lines.append("")
@@ -1154,13 +1618,17 @@ def build_notify_text_summary_and_details(
             lines.append("DB: {db} skipped_reason={r}".format(db=dbname, r=skipped_reason))
             continue
 
-        lines.append("DB: {db} planned={p} ok={ok} fail={f}".format(db=dbname, p=db_planned, ok=db_ok, f=db_fail))
+        lines.append(
+            "DB: {db} planned={p} ok={ok} fail={f} skip={s}".format(
+                db=dbname, p=db_planned, ok=db_ok, f=db_fail, s=db_skip
+            )
+        )
 
         actions = db.get("actions", []) or []
 
-        # Sort: FAIL first, then OK, then SKIP (stop-skipped)
+        # Sort: FAIL first, then OK, then SKIP
         def _sort_key(a: Dict[str, Any]) -> Tuple[int, str]:
-            if a.get("skipped_by_stop"):
+            if a.get("skipped"):
                 grp = 2
             elif a.get("ok"):
                 grp = 1
@@ -1177,9 +1645,11 @@ def build_notify_text_summary_and_details(
             if shown >= max_actions_per_db:
                 break
 
-            status = "OK" if a.get("ok") else "FAIL"
-            if a.get("skipped_by_stop"):
+            status = "FAIL"
+            if a.get("skipped"):
                 status = "SKIP"
+            elif a.get("ok"):
+                status = "OK"
 
             action = a.get("action", "")
             table = a.get("table", "")
@@ -1290,6 +1760,7 @@ def main() -> int:
             "planned_actions": 0,
             "executed_ok": 0,
             "executed_fail": 0,
+            "executed_skip": 0,
             "skipped_dbs": 0,
             "parallel_tables_per_db": parallel_tables_per_db,
             "global_parallel_limit": global_parallel_limit,
@@ -1346,6 +1817,7 @@ def main() -> int:
                 "planned": 0,
                 "ok": 0,
                 "fail": 0,
+                "skip": 0,
                 "actions": [],
             }
 
@@ -1407,19 +1879,45 @@ def main() -> int:
                     action, reason, th_dec = decide_action_verbose(c, cfg, local_now)
                     source = "thresholds"
 
+                # Apply VACUUM FULL policy guardrail (allowlist / downgrade / skip)
+                action2, vf_pol_dec = _vacuum_full_policy_adjust(
+                    cfg=cfg,
+                    dbname=dbname,
+                    schema=schema,
+                    table=table,
+                    action=action,
+                    force_matched=bool(force_dec.get("matched", False)),
+                )
+                if vf_pol_dec.get("applied"):
+                    # annotate
+                    try:
+                        th_dec = th_dec or {}
+                    except Exception:
+                        th_dec = {}
+                final_action = action2
+
                 decision = {
                     "filter": flt,
                     "force": force_dec,
                     "thresholds": th_dec,
+                    "vacuum_full_policy": vf_pol_dec,
                     "final_action": {
-                        "action": action,
+                        "action": final_action,
                         "reason": reason,
                         "source": source,
                     },
                 }
 
-                if action != "SKIP":
-                    plans.append(action_task(dbname=dbname, candidate=c, action=action, reason=reason, decision=decision))
+                if final_action != "SKIP":
+                    plans.append(
+                        action_task(
+                            dbname=dbname,
+                            candidate=c,
+                            action=final_action,
+                            reason=reason,
+                            decision=decision,
+                        )
+                    )
 
             plans, global_limit_reached = slice_plans_by_limits(
                 plans=plans,
@@ -1466,7 +1964,10 @@ def main() -> int:
                     res = vacuum_worker(cfg, t, dry_run, global_sem, json_detail_level)
                     db_report["actions"].append(res)
 
-                    if res.get("ok"):
+                    if res.get("skipped"):
+                        db_report["skip"] += 1
+                        run_summary["global"]["executed_skip"] += 1
+                    elif res.get("ok"):
                         db_report["ok"] += 1
                         run_summary["global"]["executed_ok"] += 1
                     else:
@@ -1487,7 +1988,10 @@ def main() -> int:
                         res = fut.result()
                         db_report["actions"].append(res)
 
-                        if res.get("ok"):
+                        if res.get("skipped"):
+                            db_report["skip"] += 1
+                            run_summary["global"]["executed_skip"] += 1
+                        elif res.get("ok"):
                             db_report["ok"] += 1
                             run_summary["global"]["executed_ok"] += 1
                         else:
@@ -1499,11 +2003,12 @@ def main() -> int:
 
             run_summary["db_results"].append(db_report)
             logging.info(
-                "db_end=%s planned=%d ok=%d fail=%d",
+                "db_end=%s planned=%d ok=%d fail=%d skip=%d",
                 dbname,
                 db_report["planned"],
                 db_report["ok"],
                 db_report["fail"],
+                db_report["skip"],
             )
 
             if sleep_between_databases_sec > 0:

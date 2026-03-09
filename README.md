@@ -9,9 +9,13 @@ filters tables by schema and object patterns, decides actions using configurable
 thresholds, and executes with per-database and global concurrency limits.
 
 It also supports:
+
 - JSON run reports (basic or verbose)
 - Slack and Telegram notifications (optional)
 - Graceful and immediate stop signals
+- Best-effort prechecks for conflicting maintenance activity
+- Retry and backoff for retryable failures
+- VACUUM FULL safety guardrails
 
 ---
 
@@ -26,6 +30,10 @@ It also supports:
 - Graceful stop and immediate stop support
 - JSON summary with optional verbose detail
 - Slack / Telegram notifications
+- Precheck support for autovacuum / vacuum / analyze conflict avoidance
+- Retry / backoff policy for retryable failures
+- VACUUM FULL allowlist guardrail with downgrade / skip behavior
+- Separate tracking of successful, failed, and skipped actions
 
 ---
 
@@ -38,33 +46,44 @@ It also supports:
 
 ### Runtime Dependencies
 
+#### Modern build (`pg_vacman.py`)
+
 - PostgreSQL driver:
-  - Modern: `psycopg` (v3 preferred)
-  - Fallback: `psycopg2-binary`
-  - Legacy (Python 3.6): pin `psycopg2-binary==2.9.6` (cp36 wheels)
+  - `psycopg` (v3 preferred)
+  - fallback: `psycopg2-binary`
 - YAML configuration loader:
-  - Modern: `PyYAML>=6`
-  - Legacy (Python 3.6): pin `PyYAML==6.0.1` (`6.0.2+` requires Python >=3.8)
+  - `PyYAML>=6`
 - HTTP client for notifications:
-  - Optional: `requests` (Python 3.6: pin `requests==2.27.1`)
+  - optional: `requests`
+
+#### Legacy build (`pg_vacman_py36.py`)
+
+- PostgreSQL driver:
+  - `psycopg2-binary==2.9.6`
+- YAML configuration loader:
+  - `PyYAML==6.0.1`
+- HTTP client for notifications:
+  - optional: `requests==2.27.1`
+  - when `requests` is unavailable or unusable, the script falls back to stdlib `urllib`
 
 ### PostgreSQL Privileges
 
 The configured database user must be able to:
 
 - CONNECT to target databases
-- Read system catalogs and statistics (e.g. `pg_stat_user_tables`)
+- Read system catalogs and statistics (for example `pg_stat_user_tables`)
 - Run `ANALYZE` and `VACUUM` on target tables
 
 > **VACUUM FULL warning**  
 > `VACUUM FULL` takes **ACCESS EXCLUSIVE** locks and rewrites tables.  
-> This can block reads and writes. Keep it disabled unless you have a controlled maintenance window.
+> It can block reads and writes. Keep it disabled unless you have a controlled maintenance window.
 
 ---
 
 ## Installation
 
-Create a Virtual Environment (Recommended)
+### Create a Virtual Environment (Recommended)
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -73,8 +92,10 @@ pip install --upgrade pip
 
 ### Install Dependencies
 
-Using `requirements.txt` (Recommended)
-Create a `requirements.txt` file with the following contents:
+#### Modern Python (Recommended)
+
+Using `requirements.txt`:
+
 ```txt
 psycopg[binary]>=3.1,<4.0
 psycopg2-binary>=2.9,<3.0
@@ -82,12 +103,15 @@ PyYAML>=6.0,<7.0
 requests>=2.25,<3.0
 dataclasses; python_version < "3.7"
 ```
-Install all dependencies:
+
+Install:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Manual Installation (Alternative)
+#### Manual Installation
+
 ```bash
 pip install "psycopg[binary]>=3.1,<4.0" \
             "psycopg2-binary>=2.9,<3.0" \
@@ -95,7 +119,7 @@ pip install "psycopg[binary]>=3.1,<4.0" \
             "requests>=2.25,<3.0"
 ```
 
-Legacy (Python 3.6 / RHEL7-CentOS7)
+#### Legacy Python 3.6 / RHEL7 / CentOS7
 
 Use the compatibility entrypoint and pinned dependencies:
 
@@ -105,33 +129,44 @@ python3.6 -c "import psycopg2, yaml; print('OK')"
 python3.6 pg_vacman_py36.py --config config.local.yaml --dry-run
 ```
 
+---
+
 ## Quick Start
+
 ### 1. Copy the Example Configuration
 
 ```bash
 cp config.yaml config.local.yaml
 ```
+
 ### 2. Edit Configuration
 
 At minimum, configure:
-- db.host
-- db.port
-- db.dbname
-- db.user
-- db.password
 
-Optional sections:
-- targets.*
-- filters.*
-- thresholds.*
-- limits.*
-- notify.*
+- `db.host`
+- `db.port`
+- `db.dbname`
+- `db.user`
+- `db.password`
+
+Other commonly customized sections:
+
+- `targets.*`
+- `filters.*`
+- `thresholds.*`
+- `limits.*`
+- `precheck.*`
+- `vacuum_full_policy.*`
+- `retry.*`
+- `notify.*`
 
 ### 3. Dry Run (Plan Only)
 
 No SQL is executed.
+
 ```bash
 python3 pg_vacman.py --config config.local.yaml --dry-run
+
 # Legacy (Python 3.6):
 # python3.6 pg_vacman_py36.py --config config.local.yaml --dry-run
 ```
@@ -140,6 +175,7 @@ python3 pg_vacman.py --config config.local.yaml --dry-run
 
 ```bash
 python3 pg_vacman.py --config config.local.yaml --apply
+
 # Legacy (Python 3.6):
 # python3.6 pg_vacman_py36.py --config config.local.yaml --apply
 ```
@@ -148,15 +184,19 @@ python3 pg_vacman.py --config config.local.yaml --apply
 
 If `run.json_auto_save: true` and `--json-out` is not provided,
 a JSON summary is automatically saved to:
-```arduino
+
+```text
 run.json_out_dir/run_YYYYMMDD_HHMMSS.json
 ```
+
 To specify an explicit path:
+
 ```bash
 python3 pg_vacman.py \
   --config config.local.yaml \
   --apply \
   --json-out ./runs/run.json
+
 # Legacy (Python 3.6):
 # python3.6 pg_vacman_py36.py --config config.local.yaml --apply --json-out ./runs/run.json
 ```
@@ -190,7 +230,7 @@ Database connection settings used for both **control** and **worker** sessions.
 
 - `application_name`  
   Base PostgreSQL `application_name`  
-  (suffixes are automatically added for control/worker sessions)
+  (suffixes are automatically added for control / worker sessions)
 
 ---
 
@@ -278,8 +318,12 @@ Planner thresholds used to decide maintenance actions.
   Transaction ID age threshold for freeze consideration
 
 - `vacuum_full`  
-  Sub-configuration block for optional `VACUUM FULL` execution  
+  Sub-configuration block for optional `VACUUM FULL` planning  
   (time window, size threshold, dead tuple ratio)
+
+> `thresholds.vacuum_full.enabled` controls whether the planner may ever choose
+> `VACUUM FULL`.  
+> Even when enabled, `vacuum_full_policy` can still downgrade or skip it.
 
 ---
 
@@ -359,6 +403,97 @@ Overrides threshold-based decision logic when patterns match.
   List of force rules  
   (pattern format: `db:schema.table`, optional explicit action)
 
+> Force rules can still be constrained by `vacuum_full_policy` when the forced
+> action is `VACUUM_FULL_ANALYZE`, unless `vacuum_full_policy.force_bypass = true`.
+
+---
+
+### `precheck`
+
+Best-effort conflict avoidance before executing maintenance.
+
+- `enabled`  
+  Enable or disable precheck logic
+
+- `skip_if_autovacuum_running`  
+  Skip the target if autovacuum or autoanalyze is already active on the same relation
+
+- `skip_if_vacuum_running`  
+  Skip the target if another regular `VACUUM` is already active on the same relation
+
+- `skip_if_analyze_running`  
+  Skip the target if another `ANALYZE` is already active on the same relation
+
+- `skip_vacuum_full_if_relation_locked`  
+  Skip `VACUUM FULL` if the relation is already locked by another backend
+
+> Precheck is **best-effort**.  
+> The modern build uses progress views and relation lock checks where available.  
+> The Python 3.6 compatibility build uses `pg_stat_progress_vacuum`, lock checks,
+> and `pg_stat_activity` query matching as a fallback.
+
+---
+
+### `vacuum_full_policy`
+
+Additional safety controls for `VACUUM FULL`.
+
+- `enabled`  
+  Enable or disable the policy
+
+- `allow_objects`  
+  Allowlist of object patterns permitted to run `VACUUM FULL`
+
+- `on_miss`  
+  Action taken when a `VACUUM FULL` target is not allowlisted:
+  - `VACUUM_ANALYZE`
+  - `SKIP`
+
+- `force_bypass`  
+  If `true`, a matching `force` rule may bypass the allowlist
+
+This section is useful when threshold logic or force rules could otherwise produce
+a `VACUUM FULL` plan for a table that should never be rewritten in production.
+
+---
+
+### `retry`
+
+Retry and backoff policy for retryable failures.
+
+- `enabled`  
+  Enable or disable retries
+
+- `max_attempts`  
+  Maximum execution attempts per table action
+
+- `base_sleep_ms`  
+  Base retry sleep time in milliseconds
+
+- `max_sleep_ms`  
+  Maximum retry sleep time in milliseconds
+
+- `jitter_ms`  
+  Random jitter added to reduce retry synchronization
+
+- `retryable_categories`  
+  Error categories that may be retried, such as:
+  - `lock_timeout`
+  - `lock_not_available`
+  - `statement_timeout`
+  - `deadlock_detected`
+  - `serialization_failure`
+  - `query_canceled`
+
+- `overrides`  
+  Optional override rules applied by database pattern, action pattern, and time window
+
+This is especially useful when you want:
+
+- no retries during business hours
+- stronger retry behavior during maintenance windows
+- very limited retry for `VACUUM FULL`
+
 ---
 
 ### `notify`
@@ -382,26 +517,56 @@ For each table that passes all filters, `pg_vacman` evaluates maintenance needs
 in the following order:
 
 1. **Size check**
-   - Skip the table if its size is smaller than `thresholds.min_table_size_mb`.
+   - Skip the table if its size is smaller than `thresholds.min_table_size_mb`
 
 2. **Threshold evaluation**
    - Dead tuple ratio (`dead_ratio`)
    - Time since last `VACUUM` or `ANALYZE`
    - Transaction ID freeze age
 
-3. **Action selection**
-
-   One of the following actions is selected:
-
+3. **Initial action selection**
    - `ANALYZE`
    - `VACUUM_ANALYZE`
    - `VACUUM_FREEZE_ANALYZE`
    - `VACUUM_FULL_ANALYZE`
    - `SKIP`
 
-If a matching rule exists in the **`force`** configuration,  
-the threshold-based decision logic is completely bypassed and the forced action
-is applied.
+4. **Force rule override**
+   - If a matching `force` rule exists, threshold-based logic is bypassed
+
+5. **VACUUM FULL policy adjustment**
+   - If `vacuum_full_policy.enabled = true`, a planned `VACUUM FULL` may be:
+     - allowed
+     - downgraded to `VACUUM_ANALYZE`
+     - skipped
+
+6. **Execution-time precheck**
+   - Before execution, the worker may skip the action if conflicting maintenance is already running
+
+7. **Retry loop**
+   - Retryable failures may be retried according to `retry` policy
+
+---
+
+## Result States
+
+Each table action ends in one of the following states:
+
+- **OK**  
+  The maintenance action completed successfully
+
+- **FAIL**  
+  The action failed and was not skipped or retried successfully
+
+- **SKIP**  
+  The action was intentionally not executed, for example due to:
+  - graceful / immediate stop
+  - precheck conflict
+  - policy-based skip
+  - retry exhaustion for an action treated as skipped
+
+This separation is useful for operations dashboards and alerting,
+because a skipped action is often operationally different from a true failure.
 
 ---
 
@@ -417,7 +582,7 @@ Maintenance execution is controlled by two independent limits:
   - Controlled by `limits.global_parallel_limit`
   - Limits total concurrent maintenance actions across all databases
 
-Both limits are enforced internally using semaphores to ensure safe execution.
+Both limits are enforced internally using semaphores to protect the cluster from overload.
 
 ---
 
@@ -448,6 +613,9 @@ The following notification channels are supported:
 - Slack (Incoming Webhook)
 - Telegram (Bot API)
 
+For Python 3.6 environments, notifications still work even if `requests` is unavailable,
+because the compatibility build can fall back to stdlib `urllib`.
+
 ---
 
 ## JSON Run Report
@@ -459,8 +627,10 @@ Each run can produce a structured JSON report containing:
 - Per-database summaries
 - Per-action execution details
 - Verbose decision context (when enabled)
+- Retry attempt history
+- Precheck details (when available)
 
-This report can be used for auditing, troubleshooting, or historical analysis.
+This report can be used for auditing, troubleshooting, and historical analysis.
 
 ---
 
@@ -468,13 +638,16 @@ This report can be used for auditing, troubleshooting, or historical analysis.
 
 For initial or production use:
 
-- Keep `vacuum_full.enabled` set to `false`
-- Start with conservative thresholds:
-  - `max_analyze_age_hours: 24`
-  - `max_last_vacuum_age_hours: 48`
-- Limit concurrency:
+- Keep `thresholds.vacuum_full.enabled` set to `false`
+- Enable `vacuum_full_policy.enabled` for guardrail protection
+- Use `vacuum_full_policy.allow_objects` only for explicitly approved targets
+- Enable `precheck.enabled` to avoid collisions with autovacuum
+- Start with conservative concurrency:
   - `parallel_tables_per_db: 1`
-  - `global_parallel_limit: 1`
+  - `global_parallel_limit: 1` or `2`
+- Prefer limited retry behavior:
+  - disable or reduce retry during business hours
+  - allow slightly stronger retry during night maintenance windows
 - Always validate behavior using `--dry-run` before applying changes
 
 ---
@@ -495,6 +668,7 @@ This is useful for unattended maintenance in production environments.
 ### Basic Daily Run (Dry Run)
 
 Runs every day at **01:00**, planning only (no SQL execution):
+
 ```cron
 0 1 * * * /usr/bin/python3 /opt/pg_vacman/pg_vacman.py \
   --config /opt/pg_vacman/config.local.yaml \
@@ -503,20 +677,29 @@ Runs every day at **01:00**, planning only (no SQL execution):
 
 ### Daily Apply Run (Recommended Pattern)
 
-Runs every day at 02:00, executing actions:
+Runs every day at **02:00**, executing actions:
+
 ```cron
 0 2 * * * /usr/bin/python3 /opt/pg_vacman/pg_vacman.py \
   --config /opt/pg_vacman/config.local.yaml \
   --apply >> /var/log/pg_vacman/apply.log 2>&1
 ```
 
+### Legacy Python 3.6 Apply Run
+
+```cron
+0 2 * * * /usr/bin/python3.6 /opt/pg_vacman/pg_vacman_py36.py \
+  --config /opt/pg_vacman/config.local.yaml \
+  --apply >> /var/log/pg_vacman/apply_py36.log 2>&1
+```
+
 ### Recommended Cron Practices
 
-- Always use absolute paths (/usr/bin/python3, /opt/...)
+- Always use absolute paths (`/usr/bin/python3`, `/opt/...`)
 - Redirect stdout and stderr to log files
-- Start with --dry-run when introducing new rules
-- Rely on run.advisory_lock_key to prevent overlapping executions
-- Keep VACUUM FULL disabled unless running in a controlled window
+- Start with `--dry-run` when introducing new rules
+- Rely on `run.advisory_lock_key` to prevent overlapping executions
+- Keep `VACUUM FULL` disabled unless running in a controlled window
 
 ### Example Log Rotation (Optional)
 
