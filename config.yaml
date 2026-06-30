@@ -83,6 +83,10 @@ run:
 
   # Automatically save JSON report if --json-out is not specified.
   json_auto_save: true
+
+  # Treat JSON report save failures as a non-zero process exit.
+  json_fail_on_error: true
+
   json_out_dir: "./runs"
   json_out_prefix: "run"
 
@@ -92,6 +96,13 @@ run:
   # Include executed SQL in notifications.
   # Keep false unless debugging is required.
   notify_include_sql: false
+
+  # Track repeated table-level SKIP results across runs.
+  skip_history_enabled: true
+  skip_history_path: "./runs/skip_history.json"
+  skip_history_threshold: 3
+  skip_history_fail_on_threshold: true
+  skip_history_reset_on_ok: true
 
 
 # =========================================================
@@ -124,6 +135,10 @@ thresholds:
     # Additional conditions for VACUUM FULL planning.
     min_dead_ratio: 0.60
     min_table_size_mb: 2048
+    # Optional estimated dead-space guardrails based on pg_stats.avg_width * n_dead_tup.
+    # 0 disables each estimated condition.
+    min_estimated_dead_mb: 0
+    min_estimated_dead_ratio: 0
 
 
 # =========================================================
@@ -298,3 +313,19 @@ notify:
   # Telegram bot settings.
   telegram_bot_token: ""
   telegram_chat_id: ""
+
+
+# =========================================================
+# Metrics export
+# =========================================================
+metrics:
+  # Metrics are best-effort and do not fail the run.
+  enabled: false
+
+  # Optional Prometheus node_exporter textfile collector path.
+  prometheus_textfile: "./runs/pg_vacman.prom"
+
+  # Optional StatsD UDP target. Leave host empty to disable StatsD.
+  statsd_host: ""
+  statsd_port: 8125
+  statsd_prefix: "pg_vacman"

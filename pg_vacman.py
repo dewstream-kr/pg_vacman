@@ -42,6 +42,7 @@ import logging
 import os
 import random
 import signal
+import socket
 import sys
 import threading
 import time
@@ -49,8 +50,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-import yaml
+try:
+    import requests
+except Exception:
+    requests = None  # type: ignore
 
 try:
     import psycopg
@@ -59,8 +62,11 @@ try:
     psycopg3_available = True
 except Exception:
     psycopg3_available = False
-    import psycopg2
-    import psycopg2.extras
+    try:
+        import psycopg2
+        import psycopg2.extras
+    except Exception:
+        psycopg2 = None  # type: ignore
 
 
 # Supported actions produced by the planner.
@@ -102,6 +108,9 @@ class table_candidate:
     last_analyze: Optional[dt.datetime]
     last_autoanalyze: Optional[dt.datetime]
     freeze_age: int
+    avg_row_width_bytes: float
+    estimated_dead_bytes: float
+    estimated_dead_ratio: float
 
 
 @dataclass(frozen=True)
@@ -185,6 +194,8 @@ class pg_client:
                 )
                 self.conn.autocommit = True
             else:
+                if psycopg2 is None:
+                    raise RuntimeError("PostgreSQL driver is required. Install psycopg[binary] or psycopg2-binary.")
                 self.conn = psycopg2.connect(
                     host=db_cfg["host"],
                     port=db_cfg["port"],
@@ -242,9 +253,160 @@ def setup_logging(level_name: str) -> None:
 
 
 def load_config(path: str) -> Dict[str, Any]:
-    """Load YAML configuration file."""
+    """Load YAML or JSON configuration file."""
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw = f.read()
+
+    if path.lower().endswith(".json"):
+        return json.loads(raw)
+
+    try:
+        import yaml  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "PyYAML is required to read YAML config. Install PyYAML>=6 or use a JSON config. "
+            f"Original error: {e}"
+        )
+
+    return yaml.safe_load(raw)
+
+
+def validate_config(cfg: Dict[str, Any]) -> None:
+    """Validate configuration values that can be checked before connecting."""
+    errors: List[str] = []
+
+    def _require_section(name: str) -> Dict[str, Any]:
+        section = cfg.get(name, {}) or {}
+        if not isinstance(section, dict):
+            errors.append(f"{name} must be a mapping")
+            return {}
+        return section
+
+    def _int_at(section_name: str, section: Dict[str, Any], key: str, minimum: Optional[int] = None) -> None:
+        if key not in section:
+            return
+        try:
+            value = int(section.get(key))
+            if minimum is not None and value < minimum:
+                errors.append(f"{section_name}.{key} must be >= {minimum}")
+        except Exception:
+            errors.append(f"{section_name}.{key} must be an integer")
+
+    def _float_at(section_name: str, section: Dict[str, Any], key: str, minimum: Optional[float] = None) -> None:
+        if key not in section:
+            return
+        try:
+            value = float(section.get(key))
+            if minimum is not None and value < minimum:
+                errors.append(f"{section_name}.{key} must be >= {minimum}")
+        except Exception:
+            errors.append(f"{section_name}.{key} must be a number")
+
+    def _hhmm(path: str, value: Any) -> None:
+        try:
+            hour, minute = parse_hhmm(str(value))
+            if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                errors.append(f"{path} must be HH:MM in 00:00..23:59")
+        except Exception:
+            errors.append(f"{path} must be HH:MM")
+
+    db_cfg = _require_section("db")
+    for key in ("host", "port", "dbname", "user"):
+        if key not in db_cfg or str(db_cfg.get(key) or "").strip() == "":
+            errors.append(f"db.{key} is required")
+    _int_at("db", db_cfg, "port", 1)
+    try:
+        if "port" in db_cfg and int(db_cfg.get("port")) > 65535:
+            errors.append("db.port must be <= 65535")
+    except Exception:
+        pass
+    _int_at("db", db_cfg, "connect_timeout_sec", 1)
+
+    targets_cfg = _require_section("targets")
+    _int_at("targets", targets_cfg, "max_databases_per_run", 0)
+
+    run_cfg = _require_section("run")
+    _int_at("run", run_cfg, "advisory_lock_key")
+    _int_at("run", run_cfg, "json_max_skips_per_db", 0)
+    _int_at("run", run_cfg, "notify_max_actions_per_db", 1)
+    _int_at("run", run_cfg, "skip_history_threshold", 1)
+    if str(run_cfg.get("json_detail_level", "verbose")).strip().lower() not in ("basic", "verbose"):
+        errors.append("run.json_detail_level must be basic or verbose")
+    if bool(run_cfg.get("skip_history_enabled", True)) and not str(run_cfg.get("skip_history_path", "") or "").strip():
+        errors.append("run.skip_history_path is required when skip_history_enabled is true")
+
+    thresholds_cfg = _require_section("thresholds")
+    _float_at("thresholds", thresholds_cfg, "min_table_size_mb", 0)
+    _float_at("thresholds", thresholds_cfg, "min_dead_ratio", 0)
+    _float_at("thresholds", thresholds_cfg, "max_analyze_age_hours", 0)
+    _float_at("thresholds", thresholds_cfg, "max_last_vacuum_age_hours", 0)
+    _int_at("thresholds", thresholds_cfg, "freeze_age_threshold", 0)
+    vacuum_full_cfg = thresholds_cfg.get("vacuum_full", {}) or {}
+    if isinstance(vacuum_full_cfg, dict):
+        _hhmm("thresholds.vacuum_full.start", vacuum_full_cfg.get("start", "01:00"))
+        _hhmm("thresholds.vacuum_full.end", vacuum_full_cfg.get("end", "05:00"))
+        _float_at("thresholds.vacuum_full", vacuum_full_cfg, "min_dead_ratio", 0)
+        _float_at("thresholds.vacuum_full", vacuum_full_cfg, "min_table_size_mb", 0)
+        _float_at("thresholds.vacuum_full", vacuum_full_cfg, "min_estimated_dead_mb", 0)
+        _float_at("thresholds.vacuum_full", vacuum_full_cfg, "min_estimated_dead_ratio", 0)
+    else:
+        errors.append("thresholds.vacuum_full must be a mapping")
+
+    limits_cfg = _require_section("limits")
+    for key in ("max_tables_per_db", "max_actions_global", "sleep_between_tables_sec", "sleep_between_databases_sec"):
+        _float_at("limits", limits_cfg, key, 0)
+    _int_at("limits", limits_cfg, "parallel_tables_per_db", 1)
+    _int_at("limits", limits_cfg, "global_parallel_limit", 1)
+    _int_at("limits", limits_cfg, "lock_timeout_ms", 0)
+    _int_at("limits", limits_cfg, "per_table_statement_timeout_sec", 1)
+    _int_at("limits", limits_cfg, "vacuum_cost_delay_ms", 0)
+    _int_at("limits", limits_cfg, "vacuum_cost_limit", 0)
+
+    force_cfg = _require_section("force")
+    default_action = str(force_cfg.get("default_action", "ANALYZE")).upper().strip()
+    if default_action not in allowed_actions:
+        errors.append("force.default_action must be one of {0}".format(", ".join(sorted(allowed_actions))))
+    for idx, item in enumerate(force_cfg.get("tables") or []):
+        if isinstance(item, dict):
+            action = str(item.get("action", default_action)).upper().strip()
+            if action not in allowed_actions:
+                errors.append(f"force.tables[{idx}].action must be one of {', '.join(sorted(allowed_actions))}")
+
+    pol_cfg = _require_section("vacuum_full_policy")
+    if str(pol_cfg.get("on_miss", "VACUUM_ANALYZE")).upper().strip() not in ("VACUUM_ANALYZE", "SKIP"):
+        errors.append("vacuum_full_policy.on_miss must be VACUUM_ANALYZE or SKIP")
+
+    retry_cfg = _require_section("retry")
+    _int_at("retry", retry_cfg, "max_attempts", 1)
+    _int_at("retry", retry_cfg, "base_sleep_ms", 0)
+    _int_at("retry", retry_cfg, "max_sleep_ms", 0)
+    _int_at("retry", retry_cfg, "jitter_ms", 0)
+    for idx, ov in enumerate(retry_cfg.get("overrides") or []):
+        if not isinstance(ov, dict):
+            errors.append(f"retry.overrides[{idx}] must be a mapping")
+            continue
+        if "start" in ov or "end" in ov:
+            if "start" not in ov or "end" not in ov:
+                errors.append(f"retry.overrides[{idx}] must include both start and end")
+            else:
+                _hhmm(f"retry.overrides[{idx}].start", ov.get("start"))
+                _hhmm(f"retry.overrides[{idx}].end", ov.get("end"))
+        if "max_attempts" in ov:
+            _int_at(f"retry.overrides[{idx}]", ov, "max_attempts", 1)
+
+    metrics_cfg = _require_section("metrics")
+    if bool(metrics_cfg.get("enabled", False)):
+        if not str(metrics_cfg.get("prometheus_textfile", "") or "").strip() and not str(metrics_cfg.get("statsd_host", "") or "").strip():
+            errors.append("metrics.prometheus_textfile or metrics.statsd_host is required when metrics.enabled is true")
+    _int_at("metrics", metrics_cfg, "statsd_port", 1)
+    try:
+        if "statsd_port" in metrics_cfg and int(metrics_cfg.get("statsd_port")) > 65535:
+            errors.append("metrics.statsd_port must be <= 65535")
+    except Exception:
+        pass
+
+    if errors:
+        raise ValueError("config validation failed:\n- " + "\n- ".join(errors))
 
 
 def now_in_tz(timezone_name: str) -> dt.datetime:
@@ -332,6 +494,9 @@ def slack_notify(webhook_url: str, text: str) -> None:
     """Send a Slack message via incoming webhook."""
     if not webhook_url:
         return
+    if requests is None:
+        logging.warning("slack_notify skipped: requests is not available")
+        return
     try:
         requests.post(webhook_url, json={"text": text}, timeout=5)
     except Exception as e:
@@ -341,6 +506,9 @@ def slack_notify(webhook_url: str, text: str) -> None:
 def telegram_notify(bot_token: str, chat_id: str, text: str) -> None:
     """Send a Telegram message via bot API."""
     if not bot_token or not chat_id:
+        return
+    if requests is None:
+        logging.warning("telegram_notify skipped: requests is not available")
         return
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
@@ -627,10 +795,16 @@ def build_candidates_with_skips(
         st.last_autovacuum,
         st.last_analyze,
         st.last_autoanalyze,
-        age(c.relfrozenxid) as freeze_age
+        age(c.relfrozenxid) as freeze_age,
+        coalesce(ps.avg_row_width_bytes, 0) as avg_row_width_bytes
     from pg_class c
     join pg_namespace n on n.oid = c.relnamespace
     left join pg_stat_user_tables st on st.relid = c.oid
+    left join (
+        select schemaname, tablename, sum(avg_width)::float as avg_row_width_bytes
+        from pg_stats
+        group by schemaname, tablename
+    ) ps on ps.schemaname = n.nspname and ps.tablename = c.relname
     where {" and ".join(where_parts)}
     order by pg_total_relation_size(c.oid) desc;
     """
@@ -665,6 +839,7 @@ def build_candidates_with_skips(
                                 "n_live_tup": live,
                                 "n_dead_tup": dead,
                                 "dead_ratio": round(float(dead_ratio), 8),
+                                "avg_row_width_bytes": round(float(r.get("avg_row_width_bytes") or 0), 2),
                             },
                         }
                     )
@@ -683,12 +858,17 @@ def build_candidates_with_skips(
         except Exception:
             freeze_age_int = 0
 
+        avg_row_width = float(r.get("avg_row_width_bytes") or 0)
+        estimated_dead_bytes = float(dead) * avg_row_width
+        total_size_bytes = int(r["total_size_bytes"] or 0)
+        estimated_dead_ratio = (estimated_dead_bytes / total_size_bytes) if total_size_bytes > 0 else 0.0
+
         candidates.append(
             table_candidate(
                 schemaname=schema,
                 relname=table,
                 relid=int(r["relid"]),
-                total_size_bytes=int(r["total_size_bytes"] or 0),
+                total_size_bytes=total_size_bytes,
                 n_live_tup=live,
                 n_dead_tup=dead,
                 dead_ratio=float(dead_ratio),
@@ -697,6 +877,9 @@ def build_candidates_with_skips(
                 last_analyze=r["last_analyze"],
                 last_autoanalyze=r["last_autoanalyze"],
                 freeze_age=freeze_age_int,
+                avg_row_width_bytes=avg_row_width,
+                estimated_dead_bytes=estimated_dead_bytes,
+                estimated_dead_ratio=estimated_dead_ratio,
             )
         )
 
@@ -740,6 +923,9 @@ def decide_action_verbose(c: table_candidate, cfg: Dict[str, Any], local_now: dt
         "inputs": {
             "size_mb": float(round(size_mb, 4)),
             "dead_ratio": float(round(c.dead_ratio, 8)),
+            "avg_row_width_bytes": float(round(c.avg_row_width_bytes, 4)),
+            "estimated_dead_mb": float(round(bytes_to_mb(int(c.estimated_dead_bytes)), 4)),
+            "estimated_dead_ratio": float(round(c.estimated_dead_ratio, 8)),
             "freeze_age": int(c.freeze_age),
             "last_analyze": last_analyze.isoformat() if last_analyze else None,
             "last_vacuum": last_vacuum.isoformat() if last_vacuum else None,
@@ -752,6 +938,8 @@ def decide_action_verbose(c: table_candidate, cfg: Dict[str, Any], local_now: dt
             "max_analyze_age_hours": max_analyze_age_hours,
             "max_last_vacuum_age_hours": max_last_vacuum_age_hours,
             "freeze_age_threshold": freeze_age_threshold,
+            "vacuum_full_min_estimated_dead_mb": float((thresholds_cfg.get("vacuum_full", {}) or {}).get("min_estimated_dead_mb", 0) or 0),
+            "vacuum_full_min_estimated_dead_ratio": float((thresholds_cfg.get("vacuum_full", {}) or {}).get("min_estimated_dead_ratio", 0) or 0),
         },
         "flags": {
             "needs_analyze": bool(needs_analyze),
@@ -769,10 +957,19 @@ def decide_action_verbose(c: table_candidate, cfg: Dict[str, Any], local_now: dt
     if bool(vacuum_full_cfg.get("enabled", False)):
         full_min_dead_ratio = float(vacuum_full_cfg.get("min_dead_ratio", 0.6))
         full_min_size_mb = float(vacuum_full_cfg.get("min_table_size_mb", 2048))
+        full_min_estimated_dead_mb = float(vacuum_full_cfg.get("min_estimated_dead_mb", 0) or 0)
+        full_min_estimated_dead_ratio = float(vacuum_full_cfg.get("min_estimated_dead_ratio", 0) or 0)
         start_hhmm = str(vacuum_full_cfg.get("start", "01:00"))
         end_hhmm = str(vacuum_full_cfg.get("end", "05:00"))
+        estimated_dead_mb = bytes_to_mb(int(c.estimated_dead_bytes))
 
-        if c.dead_ratio >= full_min_dead_ratio and size_mb >= full_min_size_mb and in_time_window(local_now, start_hhmm, end_hhmm):
+        if (
+            c.dead_ratio >= full_min_dead_ratio
+            and size_mb >= full_min_size_mb
+            and estimated_dead_mb >= full_min_estimated_dead_mb
+            and c.estimated_dead_ratio >= full_min_estimated_dead_ratio
+            and in_time_window(local_now, start_hhmm, end_hhmm)
+        ):
             th_dec["rule"] = "vacuum_full enabled and conditions met => VACUUM_FULL_ANALYZE"
             return "VACUUM_FULL_ANALYZE", "VACUUM FULL conditions and time window satisfied", th_dec
 
@@ -1570,7 +1767,24 @@ def vacuum_worker(
         entry["reason"] = "graceful_stop"
         return entry
 
-    global_sem.acquire()
+    acquired = False
+    while not acquired:
+        if immediate_stop_event.is_set():
+            entry["skipped_by_stop"] = True
+            entry["skipped"] = True
+            entry["skip_reason"] = "immediate_stop"
+            entry["status"] = "SKIP"
+            entry["reason"] = "immediate_stop"
+            return entry
+        if graceful_stop_event.is_set():
+            entry["skipped_by_stop"] = True
+            entry["skipped"] = True
+            entry["skip_reason"] = "graceful_stop"
+            entry["status"] = "SKIP"
+            entry["reason"] = "graceful_stop"
+            return entry
+        acquired = global_sem.acquire(timeout=0.5)
+
     pid: Optional[int] = None
     started_at = dt.datetime.now().isoformat()
     t0 = time.time()
@@ -1787,7 +2001,8 @@ def vacuum_worker(
         except Exception:
             pass
         unregister_active_conn(pid)
-        global_sem.release()
+        if acquired:
+            global_sem.release()
 
 
 def resolve_run_mode(args: argparse.Namespace, cfg: Dict[str, Any]) -> bool:
@@ -1797,6 +2012,30 @@ def resolve_run_mode(args: argparse.Namespace, cfg: Dict[str, Any]) -> bool:
     if args.dry_run:
         return True
     return bool(cfg.get("run", {}).get("dry_run_default", True))
+
+
+def resolve_exit_code(run_summary: Dict[str, Any]) -> int:
+    """Return process exit code for scheduler/monitoring integration."""
+    if bool(run_summary.get("aborted", False)):
+        return 5
+
+    g = run_summary.get("global", {}) or {}
+    if bool(run_summary.get("json_save_failed", False)) and bool(g.get("json_fail_on_error", True)):
+        return 7
+
+    if int(g.get("executed_fail", 0) or 0) > 0:
+        return 4
+
+    sh = run_summary.get("skip_history", {}) or {}
+    if bool(sh.get("fail_on_threshold", True)) and int(sh.get("alert_count", 0) or 0) > 0:
+        return 8
+
+    for db in run_summary.get("db_results", []) or []:
+        reason = str(db.get("skipped_reason", "") or "")
+        if reason and reason != "standby":
+            return 6
+
+    return 0
 
 
 def install_signal_handlers() -> None:
@@ -1848,6 +2087,196 @@ def default_json_out_path(run_cfg: Dict[str, Any], local_now: dt.datetime) -> st
     ensure_dir(out_dir)
     ts = local_now.strftime("%Y%m%d_%H%M%S")
     return os.path.join(out_dir, f"{prefix}_{ts}.json")
+
+
+def normalize_action_status(entry: Dict[str, Any]) -> str:
+    """Normalize action result into OK/SKIP/FAIL."""
+    st = str(entry.get("status") or "").upper().strip()
+    if st in allowed_statuses:
+        return st
+    if entry.get("ok"):
+        return "OK"
+    if entry.get("skipped") or entry.get("skipped_by_stop"):
+        return "SKIP"
+    return "FAIL"
+
+
+def iter_action_results(run_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten per-database action results."""
+    out: List[Dict[str, Any]] = []
+    for db in run_summary.get("db_results", []) or []:
+        for action in db.get("actions", []) or []:
+            if isinstance(action, dict):
+                out.append(action)
+    return out
+
+
+def get_skip_history_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return repeated-SKIP history settings."""
+    run_cfg = cfg.get("run", {}) or {}
+    threshold = int(run_cfg.get("skip_history_threshold", 3) or 3)
+    if threshold < 1:
+        threshold = 3
+    return {
+        "enabled": bool(run_cfg.get("skip_history_enabled", True)),
+        "path": str(run_cfg.get("skip_history_path", "./runs/skip_history.json") or "./runs/skip_history.json"),
+        "threshold": threshold,
+        "fail_on_threshold": bool(run_cfg.get("skip_history_fail_on_threshold", True)),
+        "reset_on_ok": bool(run_cfg.get("skip_history_reset_on_ok", True)),
+    }
+
+
+def update_skip_history(cfg: Dict[str, Any], run_summary: Dict[str, Any], local_now: dt.datetime) -> None:
+    """Track repeated table-level SKIP results across runs."""
+    scfg = get_skip_history_cfg(cfg)
+    summary = {
+        "enabled": bool(scfg.get("enabled", False)),
+        "path": scfg.get("path"),
+        "threshold": int(scfg.get("threshold", 3)),
+        "fail_on_threshold": bool(scfg.get("fail_on_threshold", True)),
+        "alerts": [],
+        "updated": False,
+        "error": None,
+    }
+    run_summary["skip_history"] = summary
+
+    if not summary["enabled"]:
+        return
+
+    path = str(scfg.get("path") or "")
+    if not path:
+        summary["error"] = "skip_history_path_empty"
+        return
+
+    history: Dict[str, Any] = {}
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    history = loaded
+    except Exception as e:
+        logging.warning("skip_history_load_failed path=%s error=%s", path, str(e))
+        summary["error"] = f"load_failed: {e}"
+        history = {}
+
+    now_iso = local_now.isoformat()
+    threshold = int(scfg.get("threshold", 3))
+    reset_on_ok = bool(scfg.get("reset_on_ok", True))
+    alerts: List[Dict[str, Any]] = []
+
+    for action in iter_action_results(run_summary):
+        db = str(action.get("db") or "")
+        table = str(action.get("table") or "")
+        act = str(action.get("action") or "")
+        status = normalize_action_status(action)
+
+        if status == "OK" and reset_on_ok:
+            prefix = f"{db}|{table}|{act}|"
+            for key in list(history.keys()):
+                if key.startswith(prefix):
+                    history.pop(key, None)
+            continue
+
+        if status != "SKIP":
+            continue
+
+        reason = str(action.get("skip_reason") or action.get("reason") or "skipped")
+        key = f"{db}|{table}|{act}|{reason}"
+        rec = history.get(key)
+        if not isinstance(rec, dict):
+            rec = {"count": 0, "db": db, "table": table, "action": act, "reason": reason, "first_seen": now_iso}
+
+        rec["count"] = int(rec.get("count", 0) or 0) + 1
+        rec["db"] = db
+        rec["table"] = table
+        rec["action"] = act
+        rec["reason"] = reason
+        rec["last_seen"] = now_iso
+        history[key] = rec
+
+        if int(rec["count"]) >= threshold:
+            alerts.append(dict(rec))
+
+    summary["alerts"] = alerts
+    summary["alert_count"] = len(alerts)
+
+    try:
+        ensure_dir(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2, sort_keys=True)
+        summary["updated"] = True
+    except Exception as e:
+        logging.warning("skip_history_save_failed path=%s error=%s", path, str(e))
+        summary["error"] = f"save_failed: {e}"
+
+
+def get_metrics_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return metrics export settings."""
+    mcfg = cfg.get("metrics", {}) or {}
+    return {
+        "enabled": bool(mcfg.get("enabled", False)),
+        "prometheus_textfile": str(mcfg.get("prometheus_textfile", "") or ""),
+        "statsd_host": str(mcfg.get("statsd_host", "") or ""),
+        "statsd_port": int(mcfg.get("statsd_port", 8125) or 8125),
+        "statsd_prefix": str(mcfg.get("statsd_prefix", "pg_vacman") or "pg_vacman"),
+    }
+
+
+def build_metric_values(run_summary: Dict[str, Any], exit_code: int) -> Dict[str, int]:
+    """Build integer metric values from run summary."""
+    g = run_summary.get("global", {}) or {}
+    sh = run_summary.get("skip_history", {}) or {}
+    return {
+        "planned_actions": int(g.get("planned_actions", 0) or 0),
+        "executed_ok": int(g.get("executed_ok", 0) or 0),
+        "executed_skip": int(g.get("executed_skip", 0) or 0),
+        "executed_fail": int(g.get("executed_fail", 0) or 0),
+        "skipped_dbs": int(g.get("skipped_dbs", 0) or 0),
+        "aborted": 1 if bool(run_summary.get("aborted", False)) else 0,
+        "json_save_failed": 1 if bool(run_summary.get("json_save_failed", False)) else 0,
+        "skip_history_alerts": int(sh.get("alert_count", 0) or 0),
+        "exit_code": int(exit_code),
+    }
+
+
+def write_metrics(cfg: Dict[str, Any], run_summary: Dict[str, Any], exit_code: int) -> None:
+    """Best-effort metrics export to Prometheus textfile and/or StatsD."""
+    mcfg = get_metrics_cfg(cfg)
+    if not mcfg.get("enabled", False):
+        return
+
+    values = build_metric_values(run_summary, exit_code)
+    textfile = str(mcfg.get("prometheus_textfile") or "")
+    if textfile:
+        try:
+            ensure_dir(os.path.dirname(textfile))
+            lines = [
+                "# HELP pg_vacman_run_metric pg_vacman run-level metric",
+                "# TYPE pg_vacman_run_metric gauge",
+            ]
+            for name, value in sorted(values.items()):
+                lines.append(f'pg_vacman_run_metric{{metric="{name}"}} {int(value)}')
+            with open(textfile, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            logging.info("metrics_prometheus_textfile_saved path=%s", textfile)
+        except Exception as e:
+            logging.warning("metrics_prometheus_textfile_failed path=%s error=%s", textfile, str(e))
+
+    host = str(mcfg.get("statsd_host") or "")
+    if host:
+        port = int(mcfg.get("statsd_port", 8125) or 8125)
+        prefix = str(mcfg.get("statsd_prefix") or "pg_vacman")
+        try:
+            payload = "\n".join([f"{prefix}.{name}:{int(value)}|g" for name, value in sorted(values.items())])
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.sendto(payload.encode("utf-8"), (host, port))
+            finally:
+                sock.close()
+            logging.info("metrics_statsd_sent host=%s port=%d", host, port)
+        except Exception as e:
+            logging.warning("metrics_statsd_failed host=%s port=%s error=%s", host, port, str(e))
 
 
 def build_notify_text_summary_and_details(
@@ -1983,10 +2412,21 @@ def main() -> int:
     ap.add_argument("--json-out", default="", help="write run result json to path (if empty, auto path is used)")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
     run_cfg = cfg.get("run", {}) or {}
 
     setup_logging(str(run_cfg.get("log_level", "info")))
+    try:
+        validate_config(cfg)
+    except Exception as e:
+        logging.error("%s", str(e))
+        return 1
+
     install_signal_handlers()
 
     normalize_object_patterns(cfg)
@@ -2028,6 +2468,7 @@ def main() -> int:
         json_max_skips_per_db = 50
 
     json_auto_save = bool(run_cfg.get("json_auto_save", True))
+    json_fail_on_error = bool(run_cfg.get("json_fail_on_error", True))
 
     notify_max_actions_per_db = int(run_cfg.get("notify_max_actions_per_db", 30) or 30)
     if notify_max_actions_per_db < 1:
@@ -2045,6 +2486,9 @@ def main() -> int:
         "aborted": False,
         "abort_mode": "None",
         "detail_level": json_detail_level,
+        "json_path": "",
+        "json_save_failed": False,
+        "json_save_error": None,
         "filters_snapshot": filters_snapshot if json_detail_level == "verbose" else {},
         "global": {
             "planned_actions": 0,
@@ -2057,22 +2501,30 @@ def main() -> int:
             "max_tables_per_db": max_tables_per_db,
             "max_actions_global": max_actions_global,
             "json_max_skips_per_db": json_max_skips_per_db,
+            "json_fail_on_error": json_fail_on_error,
         },
         "db_results": [],
     }
 
     cfg_control = cfg_with_application_suffix(cfg, "control")
+    pg_lock_holder: Optional[pg_client] = None
+    pg_lock: Optional[pg_client] = None
 
-    # If we cannot connect to the control DB, fail fast.
+    # Keep the session-level advisory lock connection open for the whole run.
     try:
-        with pg_client(cfg_control, context="control") as pg_ctrl:
-            if not try_advisory_lock(pg_ctrl, advisory_lock_key):
-                msg = f"[pg_vacman] already running (advisory_lock_key={advisory_lock_key})"
-                logging.warning(msg)
-                slack_notify(notify_cfg.get("slack_webhook_url", ""), msg)
-                telegram_notify(notify_cfg.get("telegram_bot_token", ""), notify_cfg.get("telegram_chat_id", ""), msg)
-                return 2
+        pg_lock_holder = pg_client(cfg_control, context="control_lock")
+        pg_lock = pg_lock_holder.__enter__()
+        if not try_advisory_lock(pg_lock, advisory_lock_key):
+            msg = f"[pg_vacman] already running (advisory_lock_key={advisory_lock_key})"
+            logging.warning(msg)
+            slack_notify(notify_cfg.get("slack_webhook_url", ""), msg)
+            telegram_notify(notify_cfg.get("telegram_bot_token", ""), notify_cfg.get("telegram_chat_id", ""), msg)
+            pg_lock_holder.__exit__(None, None, None)
+            pg_lock_holder = None
+            return 2
 
+        with pg_client(cfg_control, context="control") as pg_ctrl:
+            apply_session_settings(pg_ctrl, cfg)
             try:
                 db_list = list_target_databases(pg_ctrl, cfg)
                 if max_databases_per_run > 0:
@@ -2080,9 +2532,16 @@ def main() -> int:
                 logging.info("target_databases=%d %s", len(db_list), db_list)
             except Exception as e:
                 logging.exception("failed to list databases: %s", e)
-                release_advisory_lock(pg_ctrl, advisory_lock_key)
+                release_advisory_lock(pg_lock, advisory_lock_key)
+                pg_lock_holder.__exit__(None, None, None)
+                pg_lock_holder = None
                 return 1
     except Exception:
+        try:
+            if pg_lock_holder is not None:
+                pg_lock_holder.__exit__(*sys.exc_info())
+        except Exception:
+            pass
         return 3
 
     global_actions_count = 0
@@ -2121,6 +2580,7 @@ def main() -> int:
             try:
                 db_cfg_ctrl = cfg_for_db(cfg_control, dbname)
                 with pg_client(db_cfg_ctrl, context=f"candidate:{dbname}") as pg_db_ctrl:
+                    apply_session_settings(pg_db_ctrl, cfg)
                     if primary_only and not is_primary(pg_db_ctrl):
                         db_report["skipped_reason"] = "standby"
                         run_summary["global"]["skipped_dbs"] += 1
@@ -2298,12 +2758,16 @@ def main() -> int:
             if sleep_between_databases_sec > 0:
                 time.sleep(sleep_between_databases_sec)
 
+        update_skip_history(cfg, run_summary, local_now)
+        run_summary["exit_code"] = resolve_exit_code(run_summary)
+
         # JSON output policy:
         # - If --json-out is provided: write there
         # - Else: if json_auto_save is true, write to default path
         json_path = args.json_out.strip()
         if not json_path and json_auto_save:
             json_path = default_json_out_path(run_cfg, local_now)
+        run_summary["json_path"] = json_path
 
         if json_path:
             try:
@@ -2311,7 +2775,13 @@ def main() -> int:
                     json.dump(run_summary, f, ensure_ascii=False, indent=2)
                 logging.info("json_saved path=%s", json_path)
             except Exception as e:
+                run_summary["json_save_failed"] = True
+                run_summary["json_save_error"] = str(e)
                 logging.error("json_save_failed path=%s error=%s", json_path, str(e))
+
+        exit_code = resolve_exit_code(run_summary)
+        run_summary["exit_code"] = exit_code
+        write_metrics(cfg, run_summary, exit_code)
 
         notify_text = build_notify_text_summary_and_details(
             run_summary=run_summary,
@@ -2327,12 +2797,19 @@ def main() -> int:
         if immediate_stop_event.is_set():
             cancel_all_active_conns()
 
-        return 0
+        if exit_code != 0:
+            logging.warning("run_exit_code=%d", exit_code)
+        return exit_code
 
     finally:
         try:
-            with pg_client(cfg_control, context="control_unlock") as pg_ctrl2:
-                release_advisory_lock(pg_ctrl2, advisory_lock_key)
+            if pg_lock is not None:
+                release_advisory_lock(pg_lock, advisory_lock_key)
+        except Exception:
+            pass
+        try:
+            if pg_lock_holder is not None:
+                pg_lock_holder.__exit__(None, None, None)
         except Exception:
             pass
 
