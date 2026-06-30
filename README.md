@@ -17,6 +17,8 @@ It also supports:
 - Retry and backoff for retryable failures
 - VACUUM FULL safety guardrails
 
+For an operator-focused runbook, see [`OPERATIONS_MANUAL.md`](OPERATIONS_MANUAL.md).
+
 ---
 
 ## Features
@@ -34,6 +36,21 @@ It also supports:
 - Retry / backoff policy for retryable failures
 - VACUUM FULL allowlist guardrail with downgrade / skip behavior
 - Separate tracking of successful, failed, and skipped actions
+- Exit codes for cron, systemd, and CI integration
+- Session-level advisory lock held for the full run to prevent overlapping runs
+
+---
+
+## Entrypoints
+
+- `pg_vacman.py` is the recommended modern entrypoint for Python 3.7+.
+- `pg_vacman_py36.py` is a legacy compatibility entrypoint for Python 3.6-era
+  hosts such as RHEL/CentOS 7.
+
+The modern entrypoint has the most detailed execution metadata, including
+explicit `OK` / `SKIP` / `FAIL` status fields in action results. The Python 3.6
+entrypoint now uses the same status contract for run summaries, while retaining
+legacy-compatible implementation details.
 
 ---
 
@@ -138,6 +155,9 @@ python3.6 pg_vacman_py36.py --config config.local.yaml --dry-run
 ```bash
 cp config.yaml config.local.yaml
 ```
+
+`config.local.yaml` is intended for environment-specific settings and is ignored
+by Git.
 
 ### 2. Edit Configuration
 
@@ -266,7 +286,9 @@ Controls which databases are processed during a run.
 Controls overall run behavior.
 
 - `advisory_lock_key`  
-  Advisory lock key to prevent overlapping executions
+  Session-level PostgreSQL advisory lock key used to prevent overlapping runs.
+  The lock connection is kept open until final cleanup, so the lock covers the
+  full database discovery, planning, execution, report, and notification flow.
 
 - `timezone`  
   Timezone used for timestamps and time-window checks
@@ -286,6 +308,9 @@ Controls overall run behavior.
 - `json_auto_save`  
   Automatically save a JSON run report
 
+- `json_fail_on_error`
+  Return a non-zero exit code when JSON report writing fails
+
 - `json_out_dir`, `json_out_prefix`  
   Output directory and filename prefix for JSON reports
 
@@ -295,6 +320,18 @@ Controls overall run behavior.
 - `notify_include_sql`  
   Include SQL statements in notifications  
   (may significantly increase message length)
+
+- `skip_history_enabled`, `skip_history_path`
+  Track repeated table-level `SKIP` results across runs
+
+- `skip_history_threshold`
+  Number of repeated skips for the same database/table/action/reason before an alert is raised
+
+- `skip_history_fail_on_threshold`
+  Return a non-zero exit code when skip history alerts are present
+
+- `skip_history_reset_on_ok`
+  Clear previous skip history for a table/action after a successful action
 
 ---
 
@@ -319,11 +356,16 @@ Planner thresholds used to decide maintenance actions.
 
 - `vacuum_full`  
   Sub-configuration block for optional `VACUUM FULL` planning  
-  (time window, size threshold, dead tuple ratio)
+  (time window, size threshold, dead tuple ratio, optional estimated dead-space threshold)
 
 > `thresholds.vacuum_full.enabled` controls whether the planner may ever choose
 > `VACUUM FULL`.  
 > Even when enabled, `vacuum_full_policy` can still downgrade or skip it.
+
+`thresholds.vacuum_full.min_estimated_dead_mb` and
+`thresholds.vacuum_full.min_estimated_dead_ratio` are optional guardrails based
+on `pg_stats.avg_width * n_dead_tup`. They are estimates, not exact bloat
+measurements, and default to `0` so existing behavior is unchanged.
 
 ---
 
@@ -511,6 +553,23 @@ Notification settings.
 
 ---
 
+### `metrics`
+
+Best-effort metrics export settings.
+
+- `enabled`
+  Enable or disable metrics export
+
+- `prometheus_textfile`
+  Optional Prometheus node_exporter textfile collector path
+
+- `statsd_host`, `statsd_port`, `statsd_prefix`
+  Optional StatsD UDP target and metric prefix
+
+Metrics failures are logged as warnings and do not fail the run.
+
+---
+
 ## Decision Logic
 
 For each table that passes all filters, `pg_vacman` evaluates maintenance needs
@@ -568,6 +627,33 @@ Each table action ends in one of the following states:
 This separation is useful for operations dashboards and alerting,
 because a skipped action is often operationally different from a true failure.
 
+Compatibility note:
+
+- Both entrypoints store explicit action `status` values.
+- Legacy `ok` / `skipped` flags are retained for compatibility.
+
+---
+
+## Exit Codes
+
+`pg_vacman` returns process exit codes suitable for cron, systemd, and CI jobs:
+
+- `0` success or table-level skips only
+- `1` failed to list target databases
+- `2` another run is already active for the advisory lock key
+- `3` failed to connect to the control database
+- `4` one or more table actions failed
+- `5` the run was aborted by a graceful or immediate stop signal
+- `6` one or more databases were skipped for a non-standby reason
+- `7` JSON report writing failed and `run.json_fail_on_error` is enabled
+- `8` repeated SKIP history reached `run.skip_history_threshold`
+
+Table-level `SKIP` results, such as lock timeout or precheck skip, remain visible
+in the JSON report and notifications but do not make the process fail by default.
+Repeated table-level skips can fail the process when skip history alerting is
+enabled. JSON report writing failures fail the process when
+`run.json_fail_on_error` is enabled.
+
 ---
 
 ## Concurrency Model
@@ -580,9 +666,11 @@ Maintenance execution is controlled by two independent limits:
 
 - **Global concurrency cap**
   - Controlled by `limits.global_parallel_limit`
-  - Limits total concurrent maintenance actions across all databases
+  - Caps concurrent maintenance workers for the run
 
-Both limits are enforced internally using semaphores to protect the cluster from overload.
+Databases are processed sequentially in the current implementation. Within the
+active database, a per-database worker pool is constrained by the global
+semaphore so the configured global cap remains a hard upper bound.
 
 ---
 
@@ -591,12 +679,12 @@ Both limits are enforced internally using semaphores to protect the cluster from
 `pg_vacman` supports graceful and immediate termination:
 
 - **Ctrl+C (once)**  
-  → Graceful stop  
-  → No new tasks are started, running tasks are allowed to finish
+  Graceful stop.
+  No new tasks are started, and running tasks are allowed to finish.
 
 - **Ctrl+C (twice) or SIGTERM**  
-  → Immediate stop  
-  → Active queries are cancelled and connections are closed
+  Immediate stop.
+  Active queries are cancelled and connections are closed.
 
 ---
 
@@ -657,6 +745,10 @@ For initial or production use:
 - Never commit real database passwords or webhook URLs
 - Treat `config.yaml` as a sample configuration only
 - Use environment-specific configuration files for real deployments
+- `config.local.yaml`, local run reports, logs, virtual environments, and
+  Python cache files are ignored by `.gitignore`
+- Restrict access to JSON reports if database names, table names, or operational
+  metadata are sensitive in your environment
 
 ---
 
