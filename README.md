@@ -17,7 +17,8 @@ It also supports:
 - Retry and backoff for retryable failures
 - VACUUM FULL safety guardrails
 
-For an operator-focused runbook, see [`OPERATIONS_MANUAL.md`](OPERATIONS_MANUAL.md).
+For operator-focused runbooks, see [`OPERATIONS_MANUAL.md`](OPERATIONS_MANUAL.md)
+or the Korean version [`OPERATIONS_MANUAL_KO.md`](OPERATIONS_MANUAL_KO.md).
 
 ---
 
